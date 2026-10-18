@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#12101a">
+<title>Chassé Studio — Remote</title>
+<style>
+  :root {
+    --bg: #12101a;
+    --panel: #1a1725;
+    --panel-2: #201c2e;
+    --line: #2e2a3c;
+    --ink: #efeaf7;
+    --muted: #9189a6;
+    --accent: #ffb454;
+    --ok: #6fd6a0;
+    --err: #ff7a90;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.45;
+    min-height: 100vh;
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    overscroll-behavior-y: contain;
+  }
+  .mono, .counter { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+  header {
+    position: sticky; top: 0; z-index: 10;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px;
+    padding: 12px 16px;
+    padding-top: max(12px, env(safe-area-inset-top));
+    background: rgba(18, 16, 26, 0.92);
+    backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--line);
+  }
+  .brand { font-weight: 700; letter-spacing: 0.02em; }
+  .brand small { display: block; font-weight: 400; font-size: 11px; color: var(--muted); letter-spacing: 0.06em; text-transform: uppercase; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+    padding: 5px 12px; border-radius: 999px;
+    border: 1px solid var(--line);
+    color: var(--muted); background: var(--panel);
+    white-space: nowrap;
+  }
+  .pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .pill.connecting    { color: var(--accent); border-color: rgba(255, 180, 84, 0.45); }
+  .pill.live          { color: var(--ok); border-color: rgba(111, 214, 160, 0.45); }
+  .pill.reconnecting  { color: var(--accent); border-color: rgba(255, 180, 84, 0.45); }
+  .pill.reconnecting::before { animation: pulse 1.2s ease-in-out infinite; }
+  .pill.offline       { color: var(--err); border-color: rgba(255, 122, 144, 0.45); }
+  .pill.expired       { color: var(--err); border-color: rgba(255, 122, 144, 0.45); }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+  main { flex: 1; width: 100%; max-width: 560px; margin: 0 auto; padding: 16px 16px calc(24px + env(safe-area-inset-bottom)); }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 20px;
+    margin: 24px auto;
+    max-width: 420px;
+    text-align: center;
+  }
+  .card h1 { font-size: 17px; margin: 0 0 8px; }
+  .card p { margin: 0; color: var(--muted); font-size: 14px; }
+  .card .big-emoji { font-size: 34px; margin-bottom: 10px; }
+
+  .now { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+  .counter { font-size: 22px; font-weight: 700; color: var(--accent); }
+  .counter .total { color: var(--muted); font-weight: 400; font-size: 15px; }
+  .stepline { color: var(--muted); font-size: 12.5px; }
+  .slide-label {
+    color: var(--muted); font-size: 13.5px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    margin-bottom: 10px; min-height: 1.4em;
+  }
+  .bar { height: 6px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line); overflow: hidden; margin-bottom: 16px; }
+  .bar > div { height: 100%; width: 0%; background: var(--accent); border-radius: inherit; transition: width 0.25s ease; }
+
+  .navrow { display: flex; gap: 10px; margin-bottom: 16px; }
+  .navrow button {
+    flex: 1; min-height: 64px;
+    font-size: 18px; font-weight: 700;
+    color: var(--ink); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 14px;
+  }
+  .navrow button:active:not(:disabled) { background: var(--panel-2); transform: translateY(1px); }
+  .navrow button:disabled, .slides button:disabled, details.notes { opacity: 0.45; }
+
+  .section-title { color: var(--muted); font-size: 11.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; margin: 4px 2px 8px; }
+  .slides { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+  .slides button {
+    display: flex; align-items: center; gap: 12px;
+    min-height: 48px; padding: 10px 14px;
+    text-align: left; font-size: 15px;
+    color: var(--ink); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 12px;
+  }
+  .slides button .num { color: var(--muted); font-size: 13px; min-width: 2ch; text-align: right; }
+  .slides button[aria-current="true"] {
+    border-color: var(--accent);
+    background: linear-gradient(180deg, rgba(255, 180, 84, 0.12), rgba(255, 180, 84, 0.05));
+  }
+  .slides button[aria-current="true"] .num { color: var(--accent); font-weight: 700; }
+  .slides button:active:not(:disabled) { background: var(--panel-2); }
+  .slides .lbl { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  details.notes {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 0; overflow: hidden;
+  }
+  details.notes summary {
+    cursor: pointer; list-style: none;
+    padding: 12px 16px; font-weight: 600; font-size: 14px;
+    color: var(--ink);
+  }
+  details.notes summary::-webkit-details-marker { display: none; }
+  details.notes summary::after { content: "▾"; float: right; color: var(--muted); }
+  details.notes[open] summary { border-bottom: 1px solid var(--line); }
+  details.notes .note-body {
+    padding: 12px 16px; color: var(--ink);
+    font-size: 14.5px; white-space: pre-wrap; overflow-wrap: break-word;
+    max-height: 40vh; overflow-y: auto;
+  }
+  .note-empty { color: var(--muted); font-style: italic; }
+  footer { color: var(--muted); font-size: 11.5px; text-align: center; padding: 0 16px 14px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">Chassé Remote<small>Studio deck control</small></div>
+  <span id="pill" class="pill connecting">connecting</span>
+</header>
+
+<main>
+  <!-- normal remote UI -->
+  <div id="app">
+    <div class="now">
+      <div id="counter" class="counter">— <span class="total">/ —</span></div>
+      <div id="stepline" class="stepline mono"></div>
+    </div>
+    <div id="slide-label" class="slide-label"></div>
+    <div class="bar"><div id="bar-fill"></div></div>
+
+    <div class="navrow">
+      <button id="btn-prev" type="button" disabled>‹ Prev</button>
+      <button id="btn-next" type="button" disabled>Next ›</button>
+    </div>
+
+    <div class="section-title">Slides</div>
+    <div id="slides" class="slides"></div>
+
+    <details class="notes" id="notes">
+      <summary>Notes for this slide</summary>
+      <div class="note-body" id="note-body"></div>
+    </details>
+  </div>
+
+  <!-- terminal cards -->
+  <div id="card-incomplete" class="card hidden">
+    <div class="big-emoji">🔗</div>
+    <h1>This link is incomplete</h1>
+    <p>Rescan the QR code from the presenter's screen.</p>
+  </div>
+  <div id="card-expired" class="card hidden">
+    <div class="big-emoji">⌛</div>
+    <h1>This QR link has expired</h1>
+    <p>Ask the presenter to reopen the QR panel and rescan.</p>
+  </div>
+</main>
+
+<footer>Chassé Studio phone remote — works over local network only</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  var qs = new URLSearchParams(location.search);
+  var deck = (qs.get("deck") || "").trim();
+  var token = (qs.get("t") || "").trim();
+
+  var el = function (id) { return document.getElementById(id); };
+  var pill = el("pill");
+  var appEl = el("app");
+  var cardIncomplete = el("card-incomplete");
+  var cardExpired = el("card-expired");
+  var counterEl = el("counter");
+  var steplineEl = el("stepline");
+  var slideLabelEl = el("slide-label");
+  var barFill = el("bar-fill");
+  var btnPrev = el("btn-prev");
+  var btnNext = el("btn-next");
+  var slidesEl = el("slides");
+  var notesEl = el("notes");
+  var noteBody = el("note-body");
+
+  var ws = null;
+  var state = null;
+  var expired = false;
+  var joinedOnce = false;
+  var retryTimer = null;
+  var attempts = 0;          // consecutive failed connects (reset on successful join)
+  var lastMsgAt = 0;         // last received message time (silence detection)
+  var wakeLock = null;
+
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+
+  function setPill(kind) {
+    pill.className = "pill " + kind;
+    pill.textContent = kind;
+  }
+
+  /* ---------------- incomplete link ---------------- */
+
+  if (!deck || !token) {
+    appEl.classList.add("hidden");
+    cardIncomplete.classList.remove("hidden");
+    setPill("offline");
+    return; // no connect
+  }
+
+  /* ---------------- websocket ---------------- */
+
+  function wsUrl() {
+    var proto = location.protocol === "https:" ? "wss:" : "ws:";
+    return proto + "//" + location.host + "/ws";
+  }
+
+  function connect() {
+    if (expired) return;
+    setPill(attempts === 0 && !joinedOnce ? "connecting"
+      : joinedOnce ? "reconnecting"
+      : attempts >= 2 ? "offline" : "connecting");
+    try {
+      ws = new WebSocket(wsUrl());
+    } catch (e) {
+      scheduleReconnect();
+      return;
+    }
+    ws.onopen = function () {
+      send({ type: "join", deckId: deck, token: token, label: (navigator.userAgent || "Phone").slice(0, 80) });
+    };
+    ws.onmessage = onMessage;
+    ws.onclose = function () { ws = null; scheduleReconnect(); };
+    ws.onerror = function () { /* onclose follows */ };
+  }
+
+  function send(obj) {
+    if (ws && ws.readyState === 1) {
+      try { ws.send(JSON.stringify(obj)); } catch (e) { /* ignore */ }
+    }
+  }
+
+  function scheduleReconnect() {
+    if (expired) return;
+    var delay = attempts === 0 ? 1500 : attempts === 1 ? 3000 : 5000;
+    attempts++;
+    setPill(joinedOnce ? "reconnecting" : (attempts >= 3 ? "offline" : "connecting"));
+    clearTimeout(retryTimer);
+    retryTimer = setTimeout(connect, delay);
+  }
+
+  function onMessage(ev) {
+    lastMsgAt = Date.now();
+    var msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (!msg || !msg.type) return;
+    switch (msg.type) {
+      case "joined":
+        joinedOnce = true;
+        attempts = 0;
+        setPill("live");
+        if (msg.state) { state = msg.state; render(); }
+        requestWakeLock();
+        break;
+      case "state":
+        if (msg.state) { state = msg.state; render(); }
+        break;
+      case "ping":
+        send({ type: "pong", t: typeof msg.t === "number" ? msg.t : Date.now() });
+        break;
+      case "pong":
+      case "presence":
+      case "ui":
+        break;
+      case "bye":
+        setPill(joinedOnce ? "reconnecting" : "connecting");
+        break;
+      case "error":
+        if (msg.message && (/token/i.test(msg.message) || /unknown deck/i.test(msg.message))) {
+          expired = true;
+          clearTimeout(retryTimer);
+          try { if (ws) ws.close(); } catch (e) { /* ignore */ }
+          ws = null;
+          setPill("expired");
+          appEl.classList.add("hidden");
+          cardExpired.classList.remove("hidden");
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
+  /* ---------------- render (server is authoritative) ---------------- */
+
+  function render() {
+    if (!state) return;
+    var order = state.order || [];
+    var idx = typeof state.index === "number" ? state.index : 0;
+    var total = order.length;
+    var cur = order[idx] || null;
+    var steps = typeof state.steps === "number" && state.steps > 0 ? state.steps : 1;
+    var step = typeof state.step === "number" ? state.step : 0;
+
+    counterEl.innerHTML = "";
+    counterEl.appendChild(document.createTextNode(pad2(Math.min(idx + 1, Math.max(total, 1))) + " "));
+    var totalSpan = document.createElement("span");
+    totalSpan.className = "total";
+    totalSpan.textContent = "/ " + pad2(total);
+    counterEl.appendChild(totalSpan);
+
+    steplineEl.textContent = steps > 1 ? ("step " + (step + 1) + " / " + steps) : "";
+
+    slideLabelEl.textContent = cur ? (cur.label || cur.id) : (total ? "" : "Waiting for slides…");
+
+    barFill.style.width = total > 0 ? (((idx + 1) / total) * 100).toFixed(2) + "%" : "0%";
+
+    var live = !!(ws && ws.readyState === 1) && joinedOnce && !expired;
+    var atStart = idx <= 0 && step <= 0;
+    var atEnd = total === 0 || (idx >= total - 1 && step >= steps - 1);
+    btnPrev.disabled = !live || atStart;
+    btnNext.disabled = !live || atEnd;
+
+    slidesEl.innerHTML = "";
+    order.forEach(function (s, i) {
+      var row = document.createElement("button");
+      row.type = "button";
+      row.disabled = !live;
+      if (i === idx) row.setAttribute("aria-current", "true");
+      var num = document.createElement("span");
+      num.className = "num";
+      num.textContent = String(i + 1);
+      var lbl = document.createElement("span");
+      lbl.className = "lbl";
+      lbl.textContent = s.label || s.id;
+      row.appendChild(num);
+      row.appendChild(lbl);
+      row.addEventListener("click", function () {
+        send({ type: "set-slide", slideId: s.id, step: 0 });
+      });
+      slidesEl.appendChild(row);
+    });
+
+    var note = typeof state.note === "string" ? state.note : "";
+    noteBody.innerHTML = "";
+    if (note) {
+      noteBody.textContent = note;
+    } else {
+      var empty = document.createElement("span");
+      empty.className = "note-empty";
+      empty.textContent = "No notes for this slide.";
+      noteBody.appendChild(empty);
+    }
+    notesEl.style.opacity = live ? "1" : "0.45";
+  }
+
+  btnPrev.addEventListener("click", function () { send({ type: "nav", dir: "prev" }); });
+  btnNext.addEventListener("click", function () { send({ type: "nav", dir: "next" }); });
+
+  /* ---------------- heartbeat ---------------- */
+
+  setInterval(function () {
+    var now = Date.now();
+    if (ws && ws.readyState === 1) {
+      if (lastMsgAt && now - lastMsgAt > 15000) {
+        try { ws.close(); } catch (e) { /* ignore */ }  // silence → reconnect
+        return;
+      }
+      send({ type: "ping", t: now });
+    }
+  }, 5000);
+
+  /* ---------------- wake lock ---------------- */
+
+  function requestWakeLock() {
+    try {
+      if (navigator.wakeLock && navigator.wakeLock.request) {
+        navigator.wakeLock.request("screen").then(function (lock) {
+          wakeLock = lock;
+        }).catch(function () { /* ignore */ });
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  /* ---------------- visibility ---------------- */
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState !== "visible") return;
+    requestWakeLock();
+    if (!expired && (!ws || ws.readyState > 1)) {
+      clearTimeout(retryTimer);
+      connect(); // reconnect immediately when the user comes back
+    }
+  });
+
+  /* ---------------- swipe ---------------- */
+
+  var touchX = null, touchY = null;
+  document.addEventListener("touchstart", function (ev) {
+    if (ev.touches.length === 1) {
+      touchX = ev.touches[0].clientX;
+      touchY = ev.touches[0].clientY;
+    }
+  }, { passive: true });
+  document.addEventListener("touchend", function (ev) {
+    if (touchX === null) return;
+    var dx = ev.changedTouches[0].clientX - touchX;
+    var dy = ev.changedTouches[0].clientY - touchY;
+    touchX = touchY = null;
+    if (Math.abs(dx) > 60 && Math.abs(dy) < 40) {
+      send({ type: "nav", dir: dx < 0 ? "next" : "prev" }); // swipe left → next
+    }
+  }, { passive: true });
+
+  connect();
+})();
+</script>
+</body>
+</html>

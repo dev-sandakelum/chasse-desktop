@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Build the Chasse Studio desktop installer for Linux (DEB).
+#
+# Requirements:
+#   - JDK 14+ (17 recommended): provides jpackage
+#   - Apache Maven 3.6+ on PATH
+#   - dpkg-deb available (usually part of the base system on Debian/Ubuntu)
+#
+# Usage:  chmod +x scripts/package-linux.sh && ./scripts/package-linux.sh
+# Result: target/installer/chassestudio_1.0.0-1_amd64.deb
+
+set -euo pipefail
+
+if ! command -v mvn >/dev/null 2>&1; then
+  echo "ERROR: mvn not found on PATH. Install Apache Maven 3.6+ (https://maven.apache.org) and retry." >&2
+  exit 1
+fi
+if ! command -v jpackage >/dev/null 2>&1; then
+  echo "ERROR: jpackage not found. Install JDK 14 or newer (17 recommended) and make sure its bin directory is on PATH." >&2
+  exit 1
+fi
+
+echo "Packaging for Linux (bundles Linux JCEF natives)..."
+mvn -q -DskipTests package -Plinux
+
+mkdir -p target/installer
+
+jpackage \
+  --name ChasseStudio \
+  --input target/package \
+  --main-jar chasse-studio-desktop-1.0.0.jar \
+  --main-class com.chasse.desktop.Main \
+  --type deb \
+  --dest target/installer \
+  --app-version 1.0.0 \
+  --vendor "Chasse Studio" \
+  --description "Chasse Studio desktop app with phone remote" \
+  --java-options "-Xmx512m"
+
+echo "Done: target/installer/"
