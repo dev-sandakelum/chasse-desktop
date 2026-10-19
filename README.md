@@ -13,7 +13,7 @@ to. This desktop app embeds that sync server (Javalin, HTTP + WebSocket on one
 port) and exposes it to the web page through the JCEF JavaScript bridge. The
 phone scans a QR code and loads a **self-contained remote page served by this
 app over LAN HTTP** — never from the internet.
-
+ 
 ## How it works
 
 ```
