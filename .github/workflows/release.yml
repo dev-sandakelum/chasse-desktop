@@ -1,0 +1,125 @@
+name: Release
+
+# Triggered when a GitHub Release is published (including pre-releases).
+on:
+  release:
+    types: [published]
+
+jobs:
+  # ── Windows ────────────────────────────────────────────────────────────────
+  build-windows:
+    name: Windows (app-image → zip)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build & package
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts\package-windows.ps1
+
+      - name: Zip app-image
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path   target\installer\ChasseStudio `
+            -DestinationPath target\installer\ChasseStudio-${{ github.ref_name }}-windows.zip `
+            -Force
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/installer/ChasseStudio-${{ github.ref_name }}-windows.zip
+
+  # ── Linux ──────────────────────────────────────────────────────────────────
+  build-linux:
+    name: Linux (deb)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build & package
+        run: |
+          chmod +x scripts/package-linux.sh
+          ./scripts/package-linux.sh
+
+      - name: Rename artifact
+        run: |
+          DEB=$(ls target/installer/*.deb | head -1)
+          mv "$DEB" "target/installer/ChasseStudio-${{ github.ref_name }}-linux.deb"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/installer/ChasseStudio-${{ github.ref_name }}-linux.deb
+
+  # ── macOS (Apple Silicon) ──────────────────────────────────────────────────
+  build-macos-arm:
+    name: macOS Apple Silicon (dmg)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build & package
+        run: |
+          chmod +x scripts/package-macos.sh
+          ./scripts/package-macos.sh
+
+      - name: Rename artifact
+        run: |
+          DMG=$(ls target/installer/*.dmg | head -1)
+          mv "$DMG" "target/installer/ChasseStudio-${{ github.ref_name }}-macos-arm64.dmg"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/installer/ChasseStudio-${{ github.ref_name }}-macos-arm64.dmg
+
+  # ── macOS (Intel) ──────────────────────────────────────────────────────────
+  build-macos-intel:
+    name: macOS Intel (dmg)
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build & package
+        run: |
+          chmod +x scripts/package-macos.sh
+          ./scripts/package-macos.sh
+
+      - name: Rename artifact
+        run: |
+          DMG=$(ls target/installer/*.dmg | head -1)
+          mv "$DMG" "target/installer/ChasseStudio-${{ github.ref_name }}-macos-x64.dmg"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/installer/ChasseStudio-${{ github.ref_name }}-macos-x64.dmg
