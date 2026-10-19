@@ -44,6 +44,16 @@
     backdrop-filter: blur(6px);
     border-bottom: 1px solid var(--line);
   }
+  .head-right { display: flex; align-items: center; gap: 10px; }
+  .fs-btn {
+    width: 38px; height: 38px; padding: 0;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: var(--ink); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px;
+    cursor: pointer;
+  }
+  .fs-btn:active:not(:disabled) { background: var(--panel-2); transform: translateY(1px); }
+  .fs-btn:disabled { opacity: 0.4; cursor: default; }
   .brand { font-weight: 700; letter-spacing: 0.02em; }
   .brand small { display: block; font-weight: 400; font-size: 11px; color: var(--muted); letter-spacing: 0.06em; text-transform: uppercase; }
   .pill {
@@ -143,7 +153,19 @@
 <body>
 <header>
   <div class="brand">Chassé Remote<small>Studio deck control</small></div>
-  <span id="pill" class="pill connecting">connecting</span>
+  <div class="head-right">
+    <button id="btn-fullscreen" type="button" class="fs-btn" disabled
+            aria-label="Toggle presenter fullscreen" title="Toggle presenter fullscreen">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M8 3H5a2 2 0 0 0-2 2v3"/>
+        <path d="M16 3h3a2 2 0 0 1 2 2v3"/>
+        <path d="M8 21H5a2 2 0 0 1-2-2v-3"/>
+        <path d="M16 21h3a2 2 0 0 0 2-2v-3"/>
+      </svg>
+    </button>
+    <span id="pill" class="pill connecting">connecting</span>
+  </div>
 </header>
 
 <main>
@@ -204,6 +226,7 @@
   var barFill = el("bar-fill");
   var btnPrev = el("btn-prev");
   var btnNext = el("btn-next");
+  var btnFullscreen = el("btn-fullscreen");
   var slidesEl = el("slides");
   var notesEl = el("notes");
   var noteBody = el("note-body");
@@ -345,6 +368,7 @@
     var atEnd = total === 0 || (idx >= total - 1 && step >= steps - 1);
     btnPrev.disabled = !live || atStart;
     btnNext.disabled = !live || atEnd;
+    btnFullscreen.disabled = !live;
 
     slidesEl.innerHTML = "";
     order.forEach(function (s, i) {
@@ -381,6 +405,7 @@
 
   btnPrev.addEventListener("click", function () { send({ type: "nav", dir: "prev" }); });
   btnNext.addEventListener("click", function () { send({ type: "nav", dir: "next" }); });
+  btnFullscreen.addEventListener("click", function () { send({ type: "fullscreen", action: "toggle" }); });
 
   /* ---------------- heartbeat ---------------- */
 

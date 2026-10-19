@@ -107,6 +107,7 @@ public final class PhoneWsHandler implements SyncRooms.Listener {
             case "pong" -> {
                 // lastActivity already updated above
             }
+            case "fullscreen" -> handleFullscreen(session, msg);
             default -> server.log("warn", "Unexpected phone message type: " + type);
         }
     }
@@ -167,6 +168,21 @@ public final class PhoneWsHandler implements SyncRooms.Listener {
         if (state != null) {
             send(session, "{\"type\":\"state\",\"state\":" + gson.toJson(state) + "}");
         }
+    }
+
+    /** Phone → desktop window fullscreen control (requires a successful join). */
+    private void handleFullscreen(PhoneSession session, JsonObject msg) {
+        if (session.deckId == null) {
+            return; // control requires a successful join
+        }
+        String action = optString(msg, "action");
+        if (action == null
+                || (!action.equals("toggle") && !action.equals("enter") && !action.equals("exit"))) {
+            action = "toggle";
+        }
+        rooms.touch(session.deckId);
+        server.fireFullscreen(session.deckId, action);
+        server.log("info", "Phone requested fullscreen '" + action + "' for room " + session.deckId);
     }
 
     private void onClose(WsCloseContext ctx) {

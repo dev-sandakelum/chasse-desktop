@@ -358,6 +358,41 @@ public final class ServerManager {
     }
 
     /* ------------------------------------------------------------------ */
+    /* Remote control (phone → desktop window)                             */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Receives remote-control commands issued from a phone (e.g. a fullscreen
+     * toggle). Installed by the GUI in {@code Main}; absent in headless mode,
+     * so phone commands simply no-op there.
+     */
+    public interface RemoteControlListener {
+        /** action is one of {@code "toggle"}, {@code "enter"}, {@code "exit"}. */
+        void onFullscreen(String deckId, String action);
+    }
+
+    private final List<RemoteControlListener> remoteControlListeners = new CopyOnWriteArrayList<>();
+
+    public void addRemoteControlListener(RemoteControlListener listener) {
+        remoteControlListeners.add(listener);
+    }
+
+    public void removeRemoteControlListener(RemoteControlListener listener) {
+        remoteControlListeners.remove(listener);
+    }
+
+    /** Fired by {@link PhoneWsHandler} when a phone sends a fullscreen command. */
+    void fireFullscreen(String deckId, String action) {
+        for (RemoteControlListener l : remoteControlListeners) {
+            try {
+                l.onFullscreen(deckId, action);
+            } catch (Exception e) {
+                // never let a listener break the phone handler
+            }
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
     /* Logging                                                             */
     /* ------------------------------------------------------------------ */
 

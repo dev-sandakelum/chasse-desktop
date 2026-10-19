@@ -9,20 +9,30 @@ import org.cef.browser.CefBrowser;
 import org.cef.browser.CefFrame;
 import org.cef.handler.CefDisplayHandlerAdapter;
 
+import javax.imageio.ImageIO;
 import javax.swing.JFrame;
 import javax.swing.JMenu;
 import javax.swing.JMenuBar;
 import javax.swing.JMenuItem;
 import javax.swing.JOptionPane;
+import javax.swing.KeyStroke;
 import javax.swing.SwingUtilities;
 import javax.swing.UIManager;
 import javax.swing.WindowConstants;
 import java.awt.BorderLayout;
 import java.awt.Dimension;
+import java.awt.Image;
+import java.awt.KeyEventDispatcher;
+import java.awt.KeyboardFocusManager;
+import java.awt.Rectangle;
+import java.awt.event.KeyEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -41,6 +51,11 @@ public final class Main {
 
     public static final String APP_NAME = "Chassé Studio";
     public static final String APP_VERSION = DesktopBridge.VERSION;
+
+    /** F11 fullscreen toggle state for the main window. */
+    private static boolean fullscreen = false;
+    private static int prevExtendedState = JFrame.NORMAL;
+    private static Rectangle prevBounds = null;
 
     private Main() {
     }
@@ -215,12 +230,17 @@ public final class Main {
             SwingUtilities.invokeLater(() -> {
                 JFrame frame = new JFrame(APP_NAME);
                 frameRef.set(frame);
+                List<Image> icons = loadIconImages();
+                if (!icons.isEmpty()) {
+                    frame.setIconImages(icons);
+                }
                 frame.setSize(1280, 860);
                 frame.setMinimumSize(new Dimension(980, 640));
                 frame.setLocationRelativeTo(null);
                 frame.add(browser.getUIComponent(), BorderLayout.CENTER);
-                frame.setJMenuBar(buildMenu(frame, config, browser,
-                        () -> shutdown(shutdownStarted, servers, browser, cefApp)));
+                JMenuBar menuBar = buildMenu(frame, config, browser,
+                        () -> shutdown(shutdownStarted, servers, browser, cefApp));
+                frame.setJMenuBar(menuBar);
                 frame.setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
                 frame.addWindowListener(new WindowAdapter() {
                     @Override
@@ -229,6 +249,20 @@ public final class Main {
                     }
                 });
                 frame.setVisible(true);
+
+                // F11 fullscreen toggle: catches F11 anywhere in this window,
+                // including when the embedded webview holds keyboard focus (OSR).
+                registerF11Toggle(frame, menuBar);
+
+                // phone remote → desktop window fullscreen control
+                servers.addRemoteControlListener((deckId, action) ->
+                        SwingUtilities.invokeLater(() -> {
+                            switch (action) {
+                                case "enter" -> enterFullscreen(frame, menuBar);
+                                case "exit" -> exitFullscreen(frame, menuBar);
+                                default -> toggleFullscreen(frame, menuBar);
+                            }
+                        }));
             });
         } catch (Throwable t) {
             t.printStackTrace();
@@ -267,6 +301,14 @@ public final class Main {
         file.add(exit);
         menuBar.add(file);
 
+        JMenu view = new JMenu("View");
+        JMenuItem fullscreenItem = new JMenuItem("Toggle Fullscreen");
+        fullscreenItem.setToolTipText("Press Ctrl+F11 to enter or leave fullscreen");
+        fullscreenItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_F11, KeyEvent.CTRL_DOWN_MASK));
+        fullscreenItem.addActionListener(ev -> toggleFullscreen(frame, menuBar));
+        view.add(fullscreenItem);
+        menuBar.add(view);
+
         JMenu help = new JMenu("Help");
         JMenuItem about = new JMenuItem("About");
         about.addActionListener(ev -> JOptionPane.showMessageDialog(frame,
@@ -278,6 +320,109 @@ public final class Main {
         help.add(about);
         menuBar.add(help);
         return menuBar;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Fullscreen toggle (Ctrl+F11)                                        */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Toggles the main window between true fullscreen (no decorations, no menu
+     * bar, fills the screen) and its previous normal-window state/size/position.
+     *
+     * <p>Changing {@code undecorated} requires disposing and re-showing the
+     * frame; the embedded JCEF webview survives this re-parenting.</p>
+     */
+    private static void toggleFullscreen(JFrame frame, JMenuBar menuBar) {
+        if (fullscreen) {
+            exitFullscreen(frame, menuBar);
+        } else {
+            enterFullscreen(frame, menuBar);
+        }
+    }
+
+    /** Enters true fullscreen (no decorations / menu bar, fills the screen). */
+    private static void enterFullscreen(JFrame frame, JMenuBar menuBar) {
+        if (fullscreen) {
+            return;
+        }
+        prevExtendedState = frame.getExtendedState();
+        prevBounds = new Rectangle(frame.getX(), frame.getY(),
+                frame.getWidth(), frame.getHeight());
+        menuBar.setVisible(false);
+        frame.dispose();
+        frame.setUndecorated(true);
+        frame.setVisible(true);
+        frame.setExtendedState(JFrame.MAXIMIZED_BOTH);
+        fullscreen = true;
+    }
+
+    /** Leaves fullscreen and restores the previous window geometry. */
+    private static void exitFullscreen(JFrame frame, JMenuBar menuBar) {
+        if (!fullscreen) {
+            return;
+        }
+        frame.dispose();
+        frame.setUndecorated(false);
+        frame.setVisible(true);
+        menuBar.setVisible(true);
+        if (prevBounds != null) {
+            frame.setBounds(prevBounds);
+        }
+        frame.setExtendedState(prevExtendedState);
+        fullscreen = false;
+    }
+
+    /**
+     * Registers a {@link KeyEventDispatcher} so Ctrl+F11 toggles fullscreen even
+     * when the embedded webview (a heavyweight AWT component) holds keyboard
+     * focus. The dispatcher consumes the key so the View menu accelerator
+     * doesn't double-fire; the menu accelerator remains as the Swing-side
+     * fallback. (Plain F11 is swallowed by the native Chromium window.)
+     */
+    private static void registerF11Toggle(JFrame frame, JMenuBar menuBar) {
+        KeyboardFocusManager kfm = KeyboardFocusManager.getCurrentKeyboardFocusManager();
+        kfm.addKeyEventDispatcher(new KeyEventDispatcher() {
+            @Override
+            public boolean dispatchKeyEvent(KeyEvent e) {
+                if (e.getID() == KeyEvent.KEY_PRESSED
+                        && e.getKeyCode() == KeyEvent.VK_F11
+                        && (e.getModifiersEx() & KeyEvent.CTRL_DOWN_MASK) != 0
+                        && kfm.getActiveWindow() == frame) {
+                    SwingUtilities.invokeLater(() -> toggleFullscreen(frame, menuBar));
+                    e.consume();
+                    return true; // consumed — prevent the menu accelerator double-fire
+                }
+                return false;
+            }
+        });
+    }
+
+    /**
+     * Loads the bundled {@code /Logo.png} from the classpath and returns it
+     * scaled to the common window-icon sizes, so the app logo looks crisp in
+     * the title bar, taskbar / dock, and alt-tab switcher across platforms.
+     * Returns an empty list (and logs a warning) if the logo is missing.
+     */
+    private static List<Image> loadIconImages() {
+        List<Image> images = new ArrayList<>();
+        try (InputStream in = Main.class.getResourceAsStream("/Logo.png")) {
+            if (in == null) {
+                System.err.println("Warning: Logo.png not found on the classpath");
+                return images;
+            }
+            Image base = ImageIO.read(in);
+            if (base == null) {
+                System.err.println("Warning: Logo.png could not be decoded");
+                return images;
+            }
+            for (int size : new int[]{16, 32, 48, 64, 128, 256}) {
+                images.add(base.getScaledInstance(size, size, Image.SCALE_SMOOTH));
+            }
+        } catch (IOException e) {
+            System.err.println("Warning: could not load Logo.png: " + e.getMessage());
+        }
+        return images;
     }
 
     /** Prompts (and re-prompts on invalid input) for a full http(s) URL. Null = cancelled. */
