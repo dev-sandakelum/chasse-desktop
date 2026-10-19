@@ -1,316 +1,235 @@
 # Chassé Studio Desktop
 
-The Chassé Studio **desktop app**: it opens the hosted Chassé Studio web app (a
-Next.js presentation tool) inside an embedded Chromium webview (JCEF) so it
-behaves like normal desktop software — and it embeds the **LAN sync server**
-that powers the **Phone Remote**.
+> **The desktop companion for [Chassé Studio](https://studio-chasse.vercel.app/) — slides written as code.**
 
-## Why this exists (Problem 02)
+Chassé Studio Desktop wraps the hosted web app in a native window and adds two things the hosted site can never have on its own: a **local LAN sync server** that lets a phone act as a wireless slide remote, and a proper **desktop experience** with a custom title bar, keyboard shortcuts, and fullscreen support.
 
-The hosted website alone cannot run the local sync server needed by the phone
-remote: on serverless hosting there is no long-lived process a phone could talk
-to. This desktop app embeds that sync server (Javalin, HTTP + WebSocket on one
-port) and exposes it to the web page through the JCEF JavaScript bridge. The
-phone scans a QR code and loads a **self-contained remote page served by this
-app over LAN HTTP** — never from the internet.
- 
-## How it works
+[![Release](https://img.shields.io/github/v/release/dev-sandakelum/chasse-desktop?style=flat-square)](https://github.com/dev-sandakelum/chasse-desktop/releases)
+[![Java 17](https://img.shields.io/badge/Java-17-blue?style=flat-square)](https://adoptium.net/)
+[![License](https://img.shields.io/github/license/dev-sandakelum/chasse-desktop?style=flat-square)](LICENSE)
+
+---
+
+## What is Chassé Studio?
+
+[Chassé Studio](https://studio-chasse.vercel.app/) is a web-based presentation tool where slides are written as code. The source is hosted at [github.com/dev-sandakelum/presentation-2web](https://github.com/dev-sandakelum/presentation-2web).
+
+This desktop app is the **native shell** for that web app — it gives you:
+
+| Feature | Details |
+|---|---|
+| Native window | Custom dark title bar, drag-to-move, minimize / maximize / close |
+| Embedded browser | Chromium via JCEF — the full web app, no browser chrome |
+| Phone remote | LAN sync server lets any phone on the same Wi-Fi control slides |
+| Fullscreen | `Ctrl+F11` — also triggerable from the phone remote |
+| Offline-capable | Once the web app loads, the remote works without internet |
+
+---
+
+## Architecture
 
 ```
- ┌─────────────────────────────────────────────────────────────────┐
- │  Chassé Studio Desktop (Java)                                   │
- │                                                                 │
- │  ┌───────────────────────┐        ┌──────────────────────────┐  │
- │  │  JCEF webview         │ bridge │  Embedded sync server    │  │
- │  │  (hosted Next.js app) │◄──────►│  (Javalin, port 8765)    │  │
- │  │                       │ CefMes-│                          │  │
- │  │  window.cefQuery()    │ sage-  │  /remote   phone page    │  │
- │  │  window.__chasse-     │ Router │  /health   diagnostics   │  │
- │  │    Desktop._handle-   │        │  /api/status            │  │
- │  │    Event(...)         │        │  /ws       phones (WS)   │  │
- │  └───────────────────────┘        └───────────┬──────────────┘  │
- │        │  SyncRooms (rooms, tokens,           │                 │
- │        │  nav/step state machine)             │ 0.0.0.0:8765    │
- └────────┼──────────────────────────────────────┼─────────────────┘
-          │                                      │ LAN (same Wi-Fi)
-          ▼                                      ▼
-   https://your-site.vercel.app         📱  http://<lan-ip>:8765/remote?deck=…&t=…
+ ┌────────────────────────────────────────────────────────────┐
+ │  Chassé Studio Desktop  (Java 17 + Swing + JCEF)          │
+ │                                                            │
+ │  ┌─────────────────────┐  CefMessageRouter  ┌──────────┐  │
+ │  │  Embedded webview   │ ◄────────────────► │  Bridge  │  │
+ │  │  (JCEF / Chromium)  │                    │  (Java)  │  │
+ │  │                     │  pushed events ──► │          │  │
+ │  │  studio-chasse      │                    └────┬─────┘  │
+ │  │  .vercel.app        │                         │        │
+ │  └─────────────────────┘                    ┌────▼─────┐  │
+ │                                             │  Javalin │  │
+ │                                             │  :8765   │  │
+ │                                             │  /remote │  │
+ │                                             │  /ws     │  │
+ │                                             └────┬─────┘  │
+ └──────────────────────────────────────────────────┼────────┘
+                                                    │ LAN
+                                                    ▼
+                                           📱  Phone browser
+                                           http://<lan-ip>:8765
+                                           /remote?deck=…&t=…
 ```
 
-User flow:
+The web app talks to Java through `window.cefQuery()` (Transport A). The phone connects over WebSocket (Transport B) — same port as HTTP, token-authenticated.
 
-1. Open the Java app → it shows the web app in the window. Sync server **not** started yet.
-2. Click the QR button in the web app → a panel opens with a **Start server** button, status "stopped".
-3. Click **Start** → the page asks Java via the JS bridge (`CefMessageRouter`) to start the server → status *starting* → *running*.
-4. The server runs (Javalin, port 8765 by default); the panel shows a live log.
-5. A QR code appears — generated by the **web side** from the LAN link this app reports (the desktop app never renders QR images).
-6. The phone scans → opens `http://<lan-ip>:8765/remote?deck=..&t=..` → connects via WebSocket → the panel shows "1 phone connected".
-7. The panel has Stop/Restart; the server stops when the program closes.
+---
 
-## Requirements
+## Download
 
-- **To build**: JDK 17+ (compiled with `--release 17`), Apache Maven 3.6+.
-- **To run from source**: any JRE 17+ — the first run downloads the JCEF
-  natives (~100 MB) into `~/.chasse-studio/jcef-bundle` automatically.
-- **End users**: nothing but the installer — the per-OS packages bundle both a
-  runtime and the JCEF natives.
+Pre-built installers are on the [Releases page](https://github.com/dev-sandakelum/chasse-desktop/releases).
 
-## Build
+| Platform | File |
+|---|---|
+| Windows (x64) | `ChasseStudio-vX.X.X-windows.zip` → extract and run `ChasseStudio.exe` |
+| macOS (Apple Silicon) | `ChasseStudio-vX.X.X-macos-arm64.dmg` |
+| macOS (Intel) | `ChasseStudio-vX.X.X-macos-x64.dmg` |
+| Linux (Debian/Ubuntu) | `ChasseStudio-vX.X.X-linux.deb` |
+
+> **First launch only:** the app downloads the Chromium engine (~100 MB) into `~/.chasse-studio/jcef-bundle`. This is a one-time operation — subsequent starts are instant.
+
+---
+
+## Getting Started
+
+1. **Install** — grab the installer for your OS from the Releases page.
+2. **Launch** — on first start you'll be asked for the web app URL. Enter `https://studio-chasse.vercel.app/` (or your own self-hosted instance).
+3. **Open the QR panel** inside the web app and click **Start** to bring up the LAN sync server.
+4. **Scan the QR code** with your phone — it connects as a wireless slide remote.
+5. Use **Prev / Next** on the phone, or swipe, to control slides.
+
+---
+
+## Build from Source
+
+### Requirements
+
+- JDK 17+ (`java --version`)
+- Apache Maven 3.6+ (`mvn --version`)
+
+### Compile & run
 
 ```bash
 mvn package
-```
-
-`target/package/` then contains the runnable jar plus every dependency (the
-maven-dependency-plugin copies them there; the jar plugin outputs into the same
-directory so `target/package` is a complete classpath).
-
-## Run
-
-```bash
-# after mvn package:
 java -cp "target/package/*" com.chasse.desktop.Main
 ```
 
-(or run `com.chasse.desktop.Main` from an IDE.)
+### Create installers
 
-On first start:
+```bash
+# Windows
+powershell -ExecutionPolicy Bypass -File scripts\package-windows.ps1
 
-- If no app URL is configured, a dialog asks for it (e.g.
-  `https://your-site.vercel.app`) and saves it to `~/.chasse-studio/app.properties`.
-- The first GUI start downloads the JCEF natives (~100 MB) into
-  `~/.chasse-studio/jcef-bundle` unless you built with one of the per-platform
-  profiles below (then they are bundled in the classpath).
+# macOS (auto-detects Apple Silicon vs Intel)
+chmod +x scripts/package-macos.sh && ./scripts/package-macos.sh
+
+# Linux (produces a .deb)
+chmod +x scripts/package-linux.sh && ./scripts/package-linux.sh
+```
+
+Each script:
+1. Runs `mvn package` with the matching platform profile (bundles JCEF natives so end users don't need a separate download)
+2. Runs `jpackage` (requires JDK 14+) to produce a self-contained installer
 
 ### Headless / diagnostic mode
 
-Runs only the sync server — no GUI, no webview. Useful to smoke-test the phone
-remote without the hosted app:
+Run the sync server only — no GUI, useful for testing the phone remote in isolation:
 
 ```bash
 java -cp "target/package/*" com.chasse.desktop.Main --headless --room=demo
 ```
 
-- `--headless` — server only.
-- `--room=<deckId>` — additionally creates a diagnostic demo room (5 seeded
-  slides) and prints the phone join link
-  `http://<preferred-lan-ip>:8765/remote?deck=demo&t=<token>` to the console.
-
-### GUI-mode diagnostic flags
-
-- `--devtools=<port>` — enables Chromium remote debugging for the embedded
-  webview (`--devtools=9222`, then open `http://127.0.0.1:9222` in a normal
-  browser to inspect the app page, watch its console, and test the QR flow).
-- `--cef-arg=<switch>` — passes an extra Chromium switch through to the
-  webview (repeatable). Useful on locked-down Linux systems
-  (`--cef-arg=--no-sandbox`) or containers
-  (`--cef-arg=--disable-dev-shm-usage`).
-- `--osr` — off-screen-rendered webview instead of a native window. Slower,
-  but works on headless Linux / Xvfb / CI where a real window can't be shown.
-
-## Packaging (installers)
-
-Each script runs the matching Maven profile (which **bundles** the JCEF
-natives for that OS into the package) and then `jpackage`:
-
-| Script | Platform | Profile | Output |
-|---|---|---|---|
-| `scripts/package-windows.ps1` | Windows x64 | `-Pwindows` | `target/installer/ChasseStudio-1.0.0.msi` |
-| `scripts/package-macos.sh` | macOS (auto: arm64 / x64) | `-Pmacos-arm` or `-Pmacos-intel` | `target/installer/ChasseStudio-1.0.0.dmg` |
-| `scripts/package-linux.sh` | Linux x64 | `-Plinux` | `target/installer/chassestudio_1.0.0-1_amd64.deb` |
-
-```bash
-# macOS / Linux
-chmod +x scripts/package-macos.sh && ./scripts/package-macos.sh
-
-# Windows
-powershell -ExecutionPolicy Bypass -File scripts\package-windows.ps1
+Prints a phone join link to stdout:
+```
+  Phone remote link:
+    http://192.168.x.x:8765/remote?deck=demo&t=<token>
 ```
 
-The scripts check that `mvn` and `jpackage` (JDK 14+) exist and print a
-friendly error otherwise. `--win-menu` adds a Start-menu entry on Windows;
-`--mac-package-name "Chasse Studio"` names the .app bundle on macOS.
+---
 
 ## Configuration
 
-Precedence (highest wins): **CLI flags → user file → bundled defaults**.
+Settings are resolved in priority order: **CLI flags → user file → bundled defaults**.
 
-Bundled defaults (`src/main/resources/app.properties`):
+**Bundled defaults** (`src/main/resources/app.properties`):
 
 ```properties
-app.url=
-server.port=8765
-network.preferred-prefix=10.161.79.
-remote.page-title=Chassé Studio — Remote
+app.url=                          # hosted web app URL — first-run prompt if blank
+server.port=8765                  # LAN sync server port
+network.preferred-prefix=10.161.79.  # preferred LAN subnet for auto interface selection
 ```
 
-- `app.url` — the hosted web app to load. Empty → first-run prompt.
-- `server.port` — LAN sync server port (default 8765).
-- `network.preferred-prefix` — LAN addresses starting with this prefix win the
-  automatic interface choice (e.g. campus networks). The list only ever
-  contains RFC1918 addresses (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16).
-- User config file: `~/.chasse-studio/app.properties` (wins over bundled).
-- CLI overrides: `--app-url=https://…`, `--port=9000`, `--headless`, `--room=<deckId>`.
+**User config file:** `~/.chasse-studio/app.properties` (created automatically, wins over bundled defaults)
 
-## Security notes
+**CLI flags:**
 
-- **Bridge only trusts the configured app origin.** The origin
-  (scheme + host + port, default ports normalized, host case-insensitive) of
-  the page currently loaded in the webview must equal the origin of `app.url`.
-  Any other page gets `{"ok":false,"error":"not trusted"}` for every action
-  except `getBridgeInfo`, and receives **no pushed events**.
-- **Fixed command whitelist.** The page can only invoke the fixed bridge
-  actions listed below — never arbitrary commands.
-- **Phone control needs the room token.** Each room mints a 12-hex-char token
-  (cryptographic random); the QR link contains it. Tokens live only in the
-  process memory — restarting the app mints new ones and old QR links die.
-- **No CORS** on the LAN server: the phone page and its WebSocket are
-  same-origin by construction.
-- The server binds `0.0.0.0` (all interfaces — that is the point: reachable
-  from the LAN). It only serves the static remote page, health/status JSON and
-  the token-checked WebSocket; there is no file access of any kind.
-- Rooms are in-memory. Stopping/starting the **LAN server keeps rooms**; fully
-  exiting the app clears them (documented behaviour). Idle rooms with no
-  phones and no activity for 2 h are evicted.
+| Flag | Description |
+|---|---|
+| `--app-url=https://…` | Override the web app URL |
+| `--port=9000` | Override the sync server port |
+| `--headless` | Server-only mode, no GUI |
+| `--room=<id>` | Create a diagnostic demo room and print the join link |
+| `--devtools=9222` | Enable Chromium DevTools on `http://127.0.0.1:9222` |
+| `--cef-arg=<switch>` | Pass extra Chromium flags (repeatable) |
+| `--osr` | Off-screen rendering mode (for headless Linux / CI) |
 
-## Network notes
+---
 
-- **The phone and the laptop must be on the same network** (same Wi-Fi / hotspot).
-- **Campus / client-isolation networks** (common for `10.161.79.*`-style
-  address plans): Wi-Fi "client isolation" blocks device-to-device traffic.
-  If the phone cannot connect, try a phone **hotspot** and connect the laptop
-  to it, or use a regular home/office Wi-Fi.
-- **Firewall**: allow inbound TCP to port 8765 on the machine running the app
-  (Windows Defender asks on first start; on Linux `sudo ufw allow 8765/tcp`).
-- **Multiple interfaces** (Ethernet + Wi-Fi, VPNs, VM bridges): the app scans
-  every 5 s and reports all RFC1918 addresses; the QR panel lets you pick the
-  one the phone can reach. Auto-selection prefers the configured
-  `network.preferred-prefix`, then `10.*`, then `172.16-31.*`, then `192.168.*`.
+## Phone Remote
+
+The phone remote is a **fully self-contained HTML page** served by the embedded Javalin server. It requires no internet — everything is bundled in the jar.
+
+**Flow:**
+1. Open the QR panel in the web app → Start the server → scan the QR code.
+2. The phone opens `http://<your-ip>:8765/remote?deck=…&t=…` in its browser.
+3. The page connects over WebSocket, receives the current deck state, and shows Prev / Next controls.
+4. Swipe left/right on the phone also navigates slides.
+5. Speaker notes for the current slide are shown on the phone.
+
+**Network requirements:**
+- Phone and laptop must be on the **same network** (same Wi-Fi or one sharing the other's hotspot).
+- Campus networks with **client isolation** block device-to-device traffic — use a phone hotspot instead.
+- Allow inbound TCP on port 8765 through your firewall (Windows Defender prompts automatically; on Linux: `sudo ufw allow 8765/tcp`).
+
+---
+
+## Security
+
+- **Origin trust** — the Java bridge only accepts calls from the exact origin of the configured `app.url`. Any other page gets `{"ok":false,"error":"not trusted"}`.
+- **Token-gated phone access** — each room mints a cryptographically random 12-hex token. The QR link contains it. Restarting the app mints new tokens; old QR links become invalid.
+- **Fixed action whitelist** — the page can only invoke the documented bridge actions, never arbitrary code.
+- **No CORS** — the phone remote page and its WebSocket endpoint are same-origin by construction.
+- **LAN only** — the server binds `0.0.0.0` but only serves the static remote page, health JSON, and the token-checked WebSocket. No file system access of any kind.
+
+---
 
 ## Troubleshooting
 
-- **Blank webview / startup takes long** — the first GUI start downloads the
-  JCEF natives (~100 MB) into `~/.chasse-studio/jcef-bundle`. Watch the
-  console progress output. If your network blocks the download, build with a
-  per-platform profile (see Packaging) so natives are bundled.
-- **"Port 8765 is already in use"** — another program (or a second instance of
-  this app) holds the port. Close it or set another `server.port` in
-  `~/.chasse-studio/app.properties` (or `--port=…`).
-- **QR panel says the bridge is not trusted** — the loaded page's origin does
-  not match the configured `app.url`. Use *File → Change app URL…* to set the
-  exact origin of your hosted app.
-- **Phone scans but cannot connect** — check phone and computer are on the same
-  network, no client isolation, and the firewall allows port 8765. Try picking
-  a different interface in the QR panel. `http://<lan-ip>:8765/api/status`
-  from any LAN browser shows live diagnostics.
-- **Log tail** — the QR panel streams the last 200 log lines (server-log
-  events); the headless mode logs to stdout.
-
-## Protocol reference (Desktop Bridge Protocol v1)
-
-Keep this in sync with the web side (`src/lib/stagesmith/desktop-bridge.ts`).
-
-### Transport A — web page ↔ Java (`CefMessageRouter`, default function names)
-
-Web side detects `typeof window.cefQuery === "function"`.
-Request: `window.cefQuery({ request: JSON.stringify({id, action, payload}), persistent: false, onSuccess, onFailure })`.
-Response via `onSuccess` (a JSON string):
-`{"id":…,"ok":true,"data":{…}}` or `{"id":…,"ok":false,"error":"…"}`.
-Errors: `"not trusted"` for untrusted origins; invalid payloads return
-`"bad request"` / `"invalid deck id"` / `"invalid slides"`; unknown actions
-return `"unknown action"`.
-
-Bridge actions (web → Java):
-
-| action | payload | data on success |
-|---|---|---|
-| `getBridgeInfo` | `{}` | `{trusted:boolean, version:string, platform:string, appUrl:string}` (works untrusted) |
-| `getServerStatus` | `{}` | `{status:"stopped"\|"starting"\|"running"\|"error", port:number, addresses:[{address,iface}], selectedAddress:string\|null, error:string\|null}` |
-| `startServer` | `{}` | `{ok:true}` (async status via server-status events) |
-| `stopServer` | `{}` | `{ok:true}` |
-| `restartServer` | `{}` | `{ok:true}` |
-| `selectAddress` | `{address}` | `{selectedAddress}` |
-| `joinRoom` | `{deckId, role:"display"\|"editor", slides?:[{id,label}], slideId?, step?}` | `{state:SyncState, token:string}` |
-| `setSlide` | `{deckId, slideId, step?}` | `{ok:true}` |
-| `nav` | `{deckId, dir:"next"\|"prev"}` | `{ok:true}` |
-| `reportSteps` | `{deckId, slideId, steps}` | `{ok:true}` |
-| `syncDeck` | `{deckId, slides:[{id,label}]}` | `{ok:true}` |
-| `setNotes` | `{deckId, slideId, note}` | `{ok:true}` |
-| `setUi` | `{deckId, qr?, overview?}` | `{ok:true}` (relayed to room phones as `{"type":"ui",…}`) |
-| `getServerLog` | `{}` | `{lines:[{ts, level:"info"\|"warn"\|"error", text}, …]}` (last 200 ring lines — panel seed) |
-| `ping` | `{}` | `{t:number}` (ms epoch) |
-
-deckId validation: `/^[a-z0-9][a-z0-9-]{0,63}$/`. Slides arrays are validated
-(id + label strings, max 500 entries). **Room actions work regardless of the
-LAN server status** — rooms live in the Java process, so `joinRoom`, `setSlide`,
-`nav`, `reportSteps`, `syncDeck`, `setNotes` and `setUi` always function; the
-server actions manage the LAN listener only.
-
-Bridge events (Java → web), delivered via
-`window.__chasseDesktop && window.__chasseDesktop._handleEvent(<json-string>)` —
-**since protocol v1.1 the payload is passed as a JSON STRING literal** (Gson-escaped
-and quoted), not a raw object literal; the web lib also accepts a pre-parsed
-object for tolerance, but new builds must send the string form (see PROBLEM 09
-below):
-
-| type | payload |
+| Symptom | Fix |
 |---|---|
-| `server-status` | `{status, port, addresses:[{address,iface,display,virtual}], selectedAddress, error}` (full snapshot, every change; `display` is the friendly adapter name, `virtual` marks VM/VPN/Docker/WSL-style adapters which sort last) |
-| `server-log` | `{ts:number(ms), level:"info"\|"warn"\|"error", text:string}` |
-| `sync-state` | `{deckId, state:SyncState}` |
-| `sync-presence` | `{deckId, remotes:number}` |
-| `sync-token` | `{deckId, token:string}` (when a room's token is first minted) |
+| Blank window on first launch | JCEF natives are downloading (~100 MB) — watch the console. Check your internet connection. |
+| "Port 8765 is already in use" | Another process holds the port. Close it or set `server.port=<other>` in `~/.chasse-studio/app.properties`. |
+| "Bridge not trusted" in QR panel | The loaded page origin doesn't match `app.url`. Use *File → Change app URL…* to set the correct origin. |
+| Phone can't connect after scanning | Same network? Client isolation? Firewall blocking 8765? Try `http://<your-ip>:8765/api/status` from the phone browser for diagnostics. |
+| QR link expired on phone | The app was restarted — tokens are in-memory only. Reopen the QR panel and scan the new code. |
+| Multiple network interfaces | Use the interface picker in the QR panel to select the address the phone can reach. |
 
-> **PROBLEM 09 — events never reached the page (fixed).** The first build
-> interpolated the JSON directly into the injected JS expression, so the page
-> received an *object* while the web lib did `JSON.parse(json)` — which throws
-> on `"[object Object]"` and silently dropped every pushed event (status stayed
-> "stopped", no QR, no logs, no presence). The fix: `pushEvent` now wraps the
-> JSON in a string literal, the web handler accepts both shapes, the panel
-> polls `getServerStatus` as a fallback after lifecycle calls, and the bridge
-> logs `startServer received` / `server status changed to … — sending …` to
-> the console for debugging.
+---
 
-### Transport B — phone ↔ Java (WebSocket, same port as HTTP)
+## Keyboard Shortcuts
 
-Phone page URL: `http://<selectedAddress>:<port>/remote?deck=<deckId>&t=<token>`
-WS endpoint: `ws://<host>:<port>/ws` (no query auth; auth happens in the join message)
+| Shortcut | Action |
+|---|---|
+| `Ctrl+F11` | Toggle fullscreen |
 
-Phone → server:
+The phone remote also responds to swipe gestures (left = next, right = prev).
 
-- `{"type":"join","deckId":"…","token":"…","label":"…"}` →
-  valid: `{"type":"joined","state":SyncState}` + presence broadcast;
-  invalid: `{"type":"error","message":"Invalid or expired link token"}` then the
-  server closes (phone shows "expired", **no auto-reconnect**);
-  unknown room: `{"type":"error","message":"Unknown deck session"}` + close.
-- `{"type":"nav","dir":"next"|"prev"}` (requires successful join)
-- `{"type":"set-slide","slideId":"…","step":0}` (requires successful join)
-- `{"type":"get-state"}` → `{"type":"state","state":…}` (bound sessions)
-- `{"type":"ping","t":ms}` → `{"type":"pong","t":ms}`
-- `{"type":"pong","t":ms}` (reply to server ping)
+---
 
-Server → phone:
+## Related
 
-- `{"type":"joined","state":…}`, `{"type":"state","state":…}`,
-  `{"type":"presence","remotes":N}`, `{"type":"pong","t":ms}`,
-  `{"type":"ping","t":ms}` (every 5 s; the phone replies pong; silence > 15 s
-  closes the session), `{"type":"ui","qr":bool,"overview":bool}`,
-  `{"type":"bye","reason":"server-stopping"}`, `{"type":"error","message":"…"}`
+- **Web app source:** [github.com/dev-sandakelum/presentation-2web](https://github.com/dev-sandakelum/presentation-2web)
+- **Live web app:** [studio-chasse.vercel.app](https://studio-chasse.vercel.app/)
+- **Desktop releases:** [github.com/dev-sandakelum/chasse-desktop/releases](https://github.com/dev-sandakelum/chasse-desktop/releases)
 
-### SyncState
+---
 
-`{ deckId, slideId:string|null, index:number, step:number, steps:number, order:[{id,label}], note:string, updatedAt:number }`
+## Tech Stack
 
-(`note` — notes of the current slide — is always present in the payloads this
-app emits; the web SyncState type simply ignores the extra field.)
+| Layer | Technology |
+|---|---|
+| Language | Java 17 |
+| GUI | Swing (undecorated, fully custom title bar) |
+| Browser engine | JCEF (Java Chromium Embedded Framework) via jcefmaven |
+| HTTP + WebSocket server | Javalin 6 |
+| JSON | Gson |
+| Build | Apache Maven |
+| Packaging | jpackage (JDK 14+) |
+| CI / Releases | GitHub Actions |
 
-### Room model
+---
 
-- Rooms keyed by deckId: `{slideId, index, step, steps, order, stepsMap, notes, token(12 hex), remotes(sessionId→label), updatedAt, lastActive}`.
-- `nav` resolves steps within a slide, then slides ("prev" from step 0 goes to
-  the **last** step of the previous slide) — faithful port of the old
-  `mini-services/stagesmith-sync` service.
-- Token minted on room creation; the bridge (presenter/editor) may always
-  control; phones need the token.
-- Idle eviction: no phones and no activity for 2 h.
-- Phone liveness: server pings every 5 s, closes after 15 s of silence.
+## License
+
+See [LICENSE](LICENSE) for details.
