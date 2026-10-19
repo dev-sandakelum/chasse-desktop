@@ -31,11 +31,11 @@ Write-Host "Running jpackage..." -ForegroundColor Cyan
 jpackage `
   --name ChasseStudio `
   --input target/package `
-  --main-jar chasse-studio-desktop-1.0.0.jar `
+  --main-jar chasse-studio-desktop-1.0.2.jar `
   --main-class com.chasse.desktop.Main `
   --type app-image `
   --dest target/installer `
-  --app-version 1.0.0 `
+  --app-version 1.0.2 `
   --vendor "Chasse Studio" `
   --description "Chasse Studio desktop app with phone remote" `
   --java-options "-Xmx512m" `
@@ -46,4 +46,4 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-Write-Host "Done: target\installer\ChasseStudio-1.0.0.msi" -ForegroundColor Green
+Write-Host "Done: target\installer\ChasseStudio-1.0.2" -ForegroundColor Green

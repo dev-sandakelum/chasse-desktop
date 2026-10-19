@@ -232,4 +232,10 @@ The phone remote also responds to swipe gestures (left = next, right = prev).
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+Copyright (c) 2026 Hasitha Sandakelum. All rights reserved.
+
+This software is **proprietary and confidential**. No part of this software — including its source code, compiled binaries, or documentation — may be copied, modified, distributed, sublicensed, or reverse-engineered without the prior written permission of the author.
+
+The compiled binary may be used for personal, non-commercial purposes only.
+
+See [LICENSE](LICENSE) for the full terms.

@@ -173,7 +173,7 @@ public final class Main {
             try { UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName()); }
             catch (Exception ignored) {}
 
-            // 3. first-run URL prompt
+            // 3. first-run URL prompt (only if user has cleared the URL via user config)
             if (config.appUrl().isBlank()) {
                 String url = promptForAppUrl(null);
                 if (url == null) { System.out.println("No app URL given — exiting."); System.exit(0); return; }

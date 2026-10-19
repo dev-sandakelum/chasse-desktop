@@ -37,11 +37,11 @@ mkdir -p target/installer
 jpackage \
   --name ChasseStudio \
   --input target/package \
-  --main-jar chasse-studio-desktop-1.0.0.jar \
+  --main-jar chasse-studio-desktop-1.0.2.jar \
   --main-class com.chasse.desktop.Main \
   --type dmg \
   --dest target/installer \
-  --app-version 1.0.0 \
+  --app-version 1.0.2 \
   --vendor "Chasse Studio" \
   --description "Chasse Studio desktop app with phone remote" \
   --java-options "-Xmx512m" \
