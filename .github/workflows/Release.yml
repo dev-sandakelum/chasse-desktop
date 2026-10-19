@@ -1,0 +1,39 @@
+name: Release
+
+permissions:
+  contents: write
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build-windows:
+    name: Windows (app-image → zip)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build & package
+        shell: pwsh
+        run: ./scripts/package-windows.ps1
+
+      - name: Zip app-image
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}".TrimStart('v')
+          $zip = "target\installer\ChasseStudio-$ver-windows.zip"
+          Compress-Archive -Path target\installer\ChasseStudio -DestinationPath $zip -Force
+          echo "ZIP=$zip" >> $env:GITHUB_ENV
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}
