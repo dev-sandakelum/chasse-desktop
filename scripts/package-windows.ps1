@@ -33,13 +33,13 @@ jpackage `
   --input target/package `
   --main-jar chasse-studio-desktop-1.0.0.jar `
   --main-class com.chasse.desktop.Main `
-  --type msi `
+  --type app-image `
   --dest target/installer `
   --app-version 1.0.0 `
   --vendor "Chasse Studio" `
   --description "Chasse Studio desktop app with phone remote" `
   --java-options "-Xmx512m" `
-  --win-menu
+  --icon src/main/resources/Logo.ico
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: jpackage failed." -ForegroundColor Red
