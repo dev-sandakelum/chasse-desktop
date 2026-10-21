@@ -18,30 +18,53 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * The JCEF JavaScript bridge (Transport A of the Desktop Bridge Protocol v1).
+ * The JCEF JavaScript bridge (Transport A of the Desktop Bridge Protocol).
  *
- * <p>Web page → Java via {@code window.cefQuery} ({@code CefMessageRouter}):
- * request {@code {id, action, payload}}, response
- * {@code {"id":..,"ok":true,"data":{..}}} or {@code {"id":..,"ok":false,"error":".."}}.</p>
+ * <p>Two request protocols travel over the SAME CefMessageRouter:</p>
+ * <ul>
+ *   <li>v1 (sync): request {@code {id, action, payload}}, response
+ *       {@code {"id":..,"ok":true,"data":{..}}} or
+ *       {@code {"id":..,"ok":false,"error":".."}}</li>
+ *   <li>v2 (hello + fs, the "fs" capability): request {@code {cmd, ...params}}
+ *       answered with the raw contract shapes — e.g.
+ *       {@code {cmd:"hello"}} → {@code {app, version, capabilities:["sync","fs"]}},
+ *       {@code fs.listDecks} → {@code [{id,title,folder,slides,modified}]}, and
+ *       every failure as {@code {code, message}} with codes like
+ *       FOLDER_NOT_SET / FOLDER_MISSING / NO_OS_PERMISSION / NOT_FOUND /
+ *       TOO_LARGE / IO_ERROR. The web app falls back to browser storage when
+ *       hello does not advertise {@code "fs"}.</li>
+ * </ul>
  *
  * <p>Java → web page via {@code browser.executeJavaScript(
  * "window.__chasseDesktop && window.__chasseDesktop._handleEvent(<json>)", currentUrl, 0)}
  * — only while the current page origin matches the configured app origin.</p>
  *
  * <p>Trust model: only the configured app origin may use any action other than
- * {@code getBridgeInfo}; untrusted pages also never receive pushed events.</p>
+ * {@code getBridgeInfo}, and only the trusted app origin may use the fs
+ * commands (hello itself is capability discovery and answers any page —
+ * the same information level as getBridgeInfo). Untrusted pages also never
+ * receive pushed events.</p>
  */
 public final class DesktopBridge {
 
-    public static final String VERSION = "1.0.0";
+    public static final String VERSION = "1.2.0";
 
     private final AppConfig config;
     private final ServerManager servers;
     private final SyncRooms rooms;
+    private final FsService fs;
+    private final LoopbackFileServer fileServer;
     private final Gson gson = new Gson();
     /** Worker for server lifecycle calls (start/stop/restart block). */
     private final ExecutorService worker = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "bridge-worker");
+        t.setDaemon(true);
+        return t;
+    });
+    /** Worker for fs commands — file IO must never block the CEF UI thread,
+     *  and fs.chooseRoot shows a native dialog for as long as the user wants. */
+    private final ExecutorService fsWorker = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "fs-worker");
         t.setDaemon(true);
         return t;
     });
@@ -50,9 +73,16 @@ public final class DesktopBridge {
     private volatile String currentUrl = "";
 
     public DesktopBridge(org.cef.CefClient client, AppConfig config, ServerManager servers, SyncRooms rooms) {
+        this(client, config, servers, rooms, null, null);
+    }
+
+    public DesktopBridge(org.cef.CefClient client, AppConfig config, ServerManager servers, SyncRooms rooms,
+                         FsService fs, LoopbackFileServer fileServer) {
         this.config = config;
         this.servers = servers;
         this.rooms = rooms;
+        this.fs = fs;
+        this.fileServer = fileServer;
 
         CefMessageRouter router = CefMessageRouter.create(); // default: window.cefQuery
         router.addHandler(new QueryHandler(), false);
@@ -135,6 +165,12 @@ public final class DesktopBridge {
                 return;
             }
             JsonObject req = parsed.getAsJsonObject();
+            // protocol v2: {cmd, ...params} → raw contract responses (hello, fs.*)
+            String cmd = optString(req, "cmd");
+            if (cmd != null) {
+                handleCmd(cmd, req, callback);
+                return;
+            }
             JsonElement idEl = req.get("id");
             if (idEl != null && !idEl.isJsonNull()) {
                 id = idEl;
@@ -274,6 +310,126 @@ public final class DesktopBridge {
             }
             default -> respondError(callback, id, "unknown action");
         }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Protocol v2: hello + the fs commands                                */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Handles {@code {cmd, ...params}} requests. hello answers any page
+     * (capability discovery — the same information level as getBridgeInfo);
+     * every fs command requires the trusted app origin and runs on the fs
+     * worker (file IO + native dialogs never block the CEF UI thread).
+     */
+    private void handleCmd(String cmd, JsonObject req, CefQueryCallback callback) {
+        if ("hello".equals(cmd)) {
+            JsonObject o = new JsonObject();
+            o.addProperty("app", "chasse-desktop");
+            o.addProperty("version", VERSION);
+            com.google.gson.JsonArray caps = new com.google.gson.JsonArray();
+            caps.add("sync");
+            caps.add("fs");
+            o.add("capabilities", caps);
+            callback.success(gson.toJson(o));
+            return;
+        }
+        if (cmd.startsWith("fs.")) {
+            if (fs == null) {
+                respondCmdError(callback, FsService.CODE_IO_ERROR, "fs commands are not available");
+                return;
+            }
+            if (!isTrusted()) {
+                // only the configured app origin may touch the decks folder
+                respondCmdError(callback, FsService.CODE_FORBIDDEN,
+                        "this page is not allowed to use desktop file commands");
+                return;
+            }
+            fsWorker.execute(() -> {
+                try {
+                    JsonElement data = dispatchFs(cmd, req);
+                    callback.success(data == null ? "{}" : gson.toJson(data));
+                } catch (FsService.FsException e) {
+                    respondCmdError(callback, e.code, e.getMessage());
+                } catch (Exception e) {
+                    respondCmdError(callback, FsService.CODE_IO_ERROR,
+                            "fs command failed: " + (e.getMessage() == null ? e.toString() : e.getMessage()));
+                }
+            });
+            return;
+        }
+        respondCmdError(callback, FsService.CODE_UNKNOWN_CMD, "unknown command: " + cmd);
+    }
+
+    /** Fixed command whitelist — anything else is UNKNOWN_CMD. */
+    private JsonElement dispatchFs(String cmd, JsonObject req) throws FsService.FsException {
+        switch (cmd) {
+            case "fs.getRoot" -> {
+                return fs.getRoot();
+            }
+            case "fs.chooseRoot" -> {
+                return fs.chooseRoot();
+            }
+            case "fs.listDecks" -> {
+                return fs.listDecks();
+            }
+            case "fs.readText" -> {
+                return fs.readText(requireParam(req, "deck"), requireParam(req, "path"));
+            }
+            case "fs.writeText" -> {
+                return fs.writeText(requireParam(req, "deck"), requireParam(req, "path"),
+                        optString(req, "text"));
+            }
+            case "fs.createDeck" -> {
+                com.google.gson.JsonElement filesEl = req.get("files");
+                if (filesEl == null || !filesEl.isJsonObject()) {
+                    throw new FsService.FsException(FsService.CODE_BAD_REQUEST, "files map is required");
+                }
+                return fs.createDeck(requireParam(req, "deck"), filesEl.getAsJsonObject());
+            }
+            case "fs.deleteDeck" -> {
+                return fs.deleteDeck(requireParam(req, "deck"));
+            }
+            case "fs.duplicateDeck" -> {
+                return fs.duplicateDeck(requireParam(req, "deck"), optString(req, "copyId"),
+                        optString(req, "title"));
+            }
+            case "fs.listFiles" -> {
+                return fs.listFiles(requireParam(req, "deck"), optString(req, "dir"));
+            }
+            case "fs.delete" -> {
+                return fs.delete(requireParam(req, "deck"), requireParam(req, "path"));
+            }
+            case "fs.fileUrl" -> {
+                String deck = requireParam(req, "deck");
+                String path = requireParam(req, "path");
+                if (fileServer == null) {
+                    throw new FsService.FsException(FsService.CODE_IO_ERROR, "file server is not running");
+                }
+                FsService.checkRelPath(path);
+                JsonObject o = new JsonObject();
+                o.addProperty("url", fileServer.urlFor(deck, path));
+                return o;
+            }
+            default -> throw new FsService.FsException(FsService.CODE_UNKNOWN_CMD, "unknown command: " + cmd);
+        }
+    }
+
+    /** Required string param — BAD_REQUEST with the field name when missing. */
+    private static String requireParam(JsonObject req, String key) throws FsService.FsException {
+        String v = optString(req, key);
+        if (v == null || v.isBlank()) {
+            throw new FsService.FsException(FsService.CODE_BAD_REQUEST, "missing required field: " + key);
+        }
+        return v;
+    }
+
+    /** v2 error response: {code, message} (the contract's error shape). */
+    private void respondCmdError(CefQueryCallback callback, String code, String message) {
+        JsonObject o = new JsonObject();
+        o.addProperty("code", code);
+        o.addProperty("message", message == null ? "" : message);
+        callback.success(gson.toJson(o));
     }
 
     private void joinRoom(JsonObject payload, JsonElement id, CefQueryCallback callback) {
