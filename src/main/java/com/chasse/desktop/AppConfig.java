@@ -184,6 +184,43 @@ public final class AppConfig {
     /** Persists {@code app.url} into the user config file (creating directories as needed). */
     public void saveUserAppUrl(String url) {
         this.appUrl = url.trim();
+        saveUserProperty("app.url", this.appUrl);
+    }
+
+    /**
+     * Folder the native Save-as dialog opens at next time (updated after
+     * every download; {@code null} = use the system Downloads folder).
+     */
+    public String downloadsDir() {
+        return userProperty("downloads.dir");
+    }
+
+    /** Persists the last used downloads folder (best-effort, never throws). */
+    public void saveDownloadsDir(String dir) {
+        if (dir == null || dir.isBlank()) {
+            return; // never clear a remembered folder — keep the last good one
+        }
+        String current = downloadsDir();
+        if (dir.equals(current)) {
+            return; // unchanged — avoid pointless disk writes
+        }
+        saveUserProperty("downloads.dir", dir);
+    }
+
+    private static String userProperty(String key) {
+        Properties props = new Properties();
+        if (Files.isRegularFile(USER_FILE)) {
+            try (InputStream in = Files.newInputStream(USER_FILE)) {
+                props.load(in);
+            } catch (IOException e) {
+                return null;
+            }
+        }
+        String v = props.getProperty(key, null);
+        return v == null || v.isBlank() ? null : v.trim();
+    }
+
+    private static void saveUserProperty(String key, String value) {
         Properties props = new Properties();
         if (Files.isRegularFile(USER_FILE)) {
             try (InputStream in = Files.newInputStream(USER_FILE)) {
@@ -192,7 +229,11 @@ public final class AppConfig {
                 System.err.println("Warning: could not read " + USER_FILE + ": " + e.getMessage());
             }
         }
-        props.setProperty("app.url", this.appUrl);
+        if (value == null) {
+            props.remove(key);
+        } else {
+            props.setProperty(key, value);
+        }
         try {
             Files.createDirectories(USER_DIR);
             try (OutputStream out = Files.newOutputStream(USER_FILE)) {

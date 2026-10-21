@@ -122,7 +122,7 @@ public final class ServerManager {
         try {
             created = Javalin.create(cfg -> cfg.showJavalinBanner = false);
             Javalin app = created;
-            app.get("/remote", ctx -> ctx.contentType("text/html").result(RemotePage.html()));
+            app.get("/remote", ctx -> ctx.contentType("text/html").result(RemotePage.html(config.remotePageTitle())));
             app.get("/health", ctx -> ctx.contentType("application/json")
                     .result("{\"ok\":true,\"status\":\"running\"}"));
             app.get("/api/status", ctx -> ctx.contentType("application/json").result(apiStatusJson()));

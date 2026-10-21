@@ -96,6 +96,19 @@ public final class Main {
             System.exit(1);
             return;
         }
+        // one app instance at a time: the persistent browser profile and the
+        // sync-server port must never be shared by two processes
+        if (!config.headless() && !AppInstanceGuard.acquire()) {
+            System.err.println("Chass\u00e9 Studio is already running — showing a message and exiting.");
+            try {
+                JOptionPane.showMessageDialog(null,
+                        "Chass\u00e9 Studio is already running.\n\nUse the existing window (check your taskbar).",
+                        "Chass\u00e9 Studio", JOptionPane.INFORMATION_MESSAGE);
+            } catch (Throwable ignored) {
+            }
+            System.exit(0);
+            return;
+        }
         SyncRooms rooms    = new SyncRooms();
         ServerManager servers = new ServerManager(config, rooms);
         if (config.headless() || config.room() != null) {
@@ -166,6 +179,17 @@ public final class Main {
                 builder.addJcefArgs(config.cefArgs().toArray(new String[0]));
             if (config.devtoolsPort() > 0)
                 builder.getCefSettings().remote_debugging_port = config.devtoolsPort();
+            // PERSISTENT browser profile. Without a cache_path CEF runs in-memory
+            // (incognito-like): IndexedDB, localStorage and cookies are wiped on
+            // every app start, which silently destroyed every deck stored by the
+            // browser-store fallback of the web app. This is the root-cause fix
+            // for "the desktop app cannot save changes".
+            File appDataDir = new File(System.getProperty("user.home"), ".chasse-studio");
+            File profileDir = new File(appDataDir, "browser-profile");
+            //noinspection ResultOfMethodCallIgnored
+            profileDir.mkdirs();
+            builder.getCefSettings().root_cache_path = appDataDir.getAbsolutePath();
+            builder.getCefSettings().cache_path = profileDir.getAbsolutePath();
             builder.setAppHandler(new MavenCefAppHandlerAdapter() {});
             CefApp cefApp = builder.build();
 
@@ -205,6 +229,19 @@ public final class Main {
                 servers.log("info", "Deck file server on 127.0.0.1:" + fileServer.port() + " (loopback only)");
             }
             DesktopBridge bridge = new DesktopBridge(client, config, servers, rooms, fsService, fileServerFinal);
+
+            // the native UX the embedded window cannot provide on its own:
+            // downloads (Save-as + progress events to the page), JS dialogs
+            // (alert/confirm/prompt), beforeunload guards and external links
+            DownloadBridge downloadBridge = new DownloadBridge(config,
+                    () -> frameRef.get() == null ? null : frameRef.get());
+            downloadBridge.setEventSink(bridge::pushEvent);
+            bridge.setDownloads(downloadBridge);
+            client.addDownloadHandler(downloadBridge);
+            client.addJSDialogHandler(WindowDialogs.jsDialogs(
+                    () -> frameRef.get() == null ? null : frameRef.get()));
+            client.addLifeSpanHandler(WindowDialogs.popupsToSystemBrowser(servers));
+
             client.addDisplayHandler(new CefDisplayHandlerAdapter() {
                 @Override public void onAddressChange(CefBrowser b, CefFrame f, String url) {
                     bridge.setCurrentUrl(url);

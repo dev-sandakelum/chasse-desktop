@@ -12,12 +12,28 @@ import java.nio.charset.StandardCharsets;
  */
 public final class RemotePage {
 
+    private static final String DEFAULT_TITLE = "Chass\u00e9 Studio \u2014 Remote";
+
     private static volatile String cached;
 
     private RemotePage() {
     }
 
-    /** Returns the remote page HTML (loaded once, UTF-8). */
+    /**
+     * Returns the remote page HTML with the configured {@code remote.page-title}
+     * applied (loaded once, UTF-8; the title substitution happens on a copy so
+     * the cached original stays reusable).
+     */
+    public static String html(String title) {
+        String html = html();
+        if (title == null || title.isBlank() || title.equals(DEFAULT_TITLE)) {
+            return html;
+        }
+        return html.replace("<title>" + DEFAULT_TITLE + "</title>",
+                "<title>" + escape(title) + "</title>");
+    }
+
+    /** Returns the remote page HTML as bundled (loaded once, UTF-8). */
     public static String html() {
         String html = cached;
         if (html == null) {

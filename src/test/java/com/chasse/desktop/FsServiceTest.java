@@ -1,0 +1,321 @@
+package com.chasse.desktop;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Unit tests for the decks-folder storage layer ({@link FsService}) — the
+ * Java side of the "fs" bridge capability.
+ *
+ * <p>Covers the security core (path confinement, symlink refusal, traversal),
+ * the deck lifecycle (create/read/write/delete/duplicate), the atomic-write
+ * contract (deck.json last, no temp files left behind), limits and the
+ * contract error codes.</p>
+ *
+ * <p>What these tests deliberately do NOT cover (needs a display): the native
+ * folder chooser dialogs ({@code chooseRoot}). The bridge transport itself is
+ * exercised by the web repo's bridge-contract smoke test, whose mock
+ * implements the same Java-side contract shapes.</p>
+ */
+class FsServiceTest {
+
+    @TempDir
+    Path tempDir;
+
+    private FsService fs;
+
+    // A minimal deck.json payload that the service accepts.
+    private static JsonObject deckFiles(String title) {
+        JsonObject files = new JsonObject();
+        JsonObject deck = new JsonObject();
+        deck.addProperty("format", "smdeck");
+        deck.addProperty("format_version", 1);
+        deck.addProperty("id", "demo");
+        deck.addProperty("title", title);
+        deck.add("slides", new JsonArray());
+        files.addProperty("deck.json", deck.toString());
+        files.addProperty("theme.css", ":root { color: red; }");
+        return files;
+    }
+
+    private static String code(FsService.FsException e) {
+        return e.code;
+    }
+
+    @BeforeEach
+    void setUp() throws Exception {
+        setRoot(tempDir.resolve("decks"));
+    }
+
+    /** Creates a test-only FsService bound to a temp config file + chosen root. */
+    private void setRoot(Path root) throws Exception {
+        Files.createDirectories(root);
+        JsonObject cfg = new JsonObject();
+        cfg.addProperty("decksRoot", root.toAbsolutePath().normalize().toString());
+        cfg.addProperty("confirmedRoot", root.toAbsolutePath().normalize().toString());
+        Files.writeString(tempDir.resolve("config.json"), cfg.toString());
+        fs = new FsService(tempDir.resolve("config.json"));
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* getRoot / config persistence                                        */
+    /* ------------------------------------------------------------------ */
+
+    @Test
+    void freshServiceIsUnconfigured() throws Exception {
+        FsService fresh = new FsService(tempDir.resolve("fresh-config.json"));
+        JsonObject root = fresh.getRoot();
+        assertFalse(root.get("configured").getAsBoolean());
+        assertEquals("", root.get("path").getAsString());
+        assertFalse(root.get("valid").getAsBoolean());
+    }
+
+    @Test
+    void rootSurvivesReload() throws Exception {
+        JsonObject root = fs.getRoot();
+        assertTrue(root.get("configured").getAsBoolean());
+        assertTrue(root.get("valid").getAsBoolean());
+        assertEquals(tempDir.resolve("decks").toAbsolutePath().normalize().toString(),
+                root.get("path").getAsString());
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* path confinement (security core)                                    */
+    /* ------------------------------------------------------------------ */
+
+    @Test
+    void rejectsTraversalPaths() {
+        assertThrows(FsService.FsException.class, () -> FsService.checkRelPath("../outside"));
+        assertThrows(FsService.FsException.class, () -> FsService.checkRelPath("slides/../../outside"));
+        assertThrows(FsService.FsException.class, () -> FsService.checkRelPath(".."));
+    }
+
+    @Test
+    void rejectsIllegalPaths() {
+        assertThrows(FsService.FsException.class, () -> FsService.checkRelPath(""));
+        assertThrows(FsService.FsException.class, () -> FsService.checkRelPath("/absolute"));
+        assertThrows(FsService.FsException.class, () -> FsService.checkRelPath("back\\slash"));
+        assertThrows(FsService.FsException.class, () -> FsService.checkRelPath("dot/./segment"));
+        assertThrows(FsService.FsException.class, () -> FsService.checkRelPath("null\0byte"));
+        assertThrows(FsService.FsException.class, () -> FsService.checkRelPath("a/".repeat(120) + "x")); // > 240 chars
+    }
+
+    @Test
+    void writeThroughSymlinkIsRefused() throws Exception {
+        JsonObject created = fs.createDeck("symlinked", deckFiles("T"));
+        assertTrue(created.get("ok").getAsBoolean());
+        Path deckDir = tempDir.resolve("decks/symlinked");
+        Path outsideTarget = Files.createDirectories(tempDir.resolve("outside-target"));
+        Files.createSymbolicLink(deckDir.resolve("evil.txt"), outsideTarget);
+        FsService.FsException e = assertThrows(FsService.FsException.class,
+                () -> fs.writeText("symlinked", "evil.txt", "nope"));
+        assertEquals("BAD_REQUEST", code(e));
+    }
+
+    @Test
+    void symlinkEscapeViaMissingFileIsRefused() throws Exception {
+        // A not-yet-existing path under a SYMLINKED directory must also fail:
+        // resolveConfined checks the nearest existing ancestor's real path.
+        fs.createDeck("linkparent", deckFiles("T"));
+        Path deckDir = tempDir.resolve("decks/linkparent");
+        Path outsideTarget = Files.createDirectories(tempDir.resolve("outside-target"));
+        Files.createSymbolicLink(deckDir.resolve("assets"), outsideTarget);
+        FsService.FsException e = assertThrows(FsService.FsException.class,
+                () -> fs.writeText("linkparent", "assets/new.png", "x"));
+        assertEquals("BAD_REQUEST", code(e));
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* deck lifecycle                                                      */
+    /* ------------------------------------------------------------------ */
+
+    @Test
+    void createDeckWritesDeckJsonLastAndReadsBack() throws Exception {
+        JsonObject created = fs.createDeck("life", deckFiles("Life"));
+        assertTrue(created.get("ok").getAsBoolean());
+        assertEquals("life", created.get("id").getAsString());
+        assertTrue(Files.isRegularFile(tempDir.resolve("decks/life/deck.json")));
+        assertTrue(fs.readText("life", "deck.json").get("text").getAsString().contains("\"title\":\"Life\""));
+        assertTrue(fs.readText("life", "theme.css").get("text").getAsString().contains("red"));
+    }
+
+    @Test
+    void createDeckRequiresDeckJson() {
+        JsonObject files = new JsonObject();
+        files.addProperty("theme.css", "x");
+        FsService.FsException e = assertThrows(FsService.FsException.class,
+                () -> fs.createDeck("nodeckjson", files));
+        assertEquals("BAD_REQUEST", code(e));
+    }
+
+    @Test
+    void createDeckRejectsTraversalFileKeysAndWritesNothing() throws Exception {
+        JsonObject files = deckFiles("T");
+        files.addProperty("../escape.txt", "nope");
+        FsService.FsException e = assertThrows(FsService.FsException.class,
+                () -> fs.createDeck("escapee", files));
+        assertEquals("BAD_REQUEST", code(e));
+        assertFalse(Files.exists(tempDir.resolve("decks/escapee"))); // nothing left behind
+        assertFalse(Files.exists(tempDir.resolve("escape.txt")));
+    }
+
+    @Test
+    void createDeckRefusesDuplicatesAndBadIds() throws Exception {
+        fs.createDeck("dup", deckFiles("One"));
+        FsService.FsException e = assertThrows(FsService.FsException.class,
+                () -> fs.createDeck("dup", deckFiles("Two")));
+        assertEquals("ALREADY_EXISTS", code(e));
+
+        FsService.FsException badId = assertThrows(FsService.FsException.class,
+                () -> fs.createDeck("BAD ID", deckFiles("T")));
+        assertEquals("BAD_REQUEST", code(badId));
+        FsService.FsException badId2 = assertThrows(FsService.FsException.class,
+                () -> fs.createDeck("..", deckFiles("T")));
+        assertEquals("BAD_REQUEST", code(badId2));
+    }
+
+    @Test
+    void writeTextRoundTripsWithNoTempFilesLeftBehind() throws Exception {
+        fs.createDeck("w", deckFiles("W"));
+        fs.writeText("w", "slides/a.tsx", "export default function Slide() {}");
+        assertEquals("export default function Slide() {}",
+                fs.readText("w", "slides/a.tsx").get("text").getAsString());
+        // overwrite + read again — the atomic rename must leave a consistent file
+        fs.writeText("w", "slides/a.tsx", "// v2");
+        assertEquals("// v2", fs.readText("w", "slides/a.tsx").get("text").getAsString());
+        try (var s = Files.list(tempDir.resolve("decks/w"))) {
+            assertTrue(s.noneMatch(p -> p.getFileName().toString().contains(".chasse-tmp")),
+                    "atomic write left temp files behind");
+        }
+    }
+
+    @Test
+    void writeTextEnforcesSizeLimit() throws Exception {
+        fs.createDeck("big", deckFiles("B"));
+        String huge = "x".repeat(2 * 1024 * 1024 + 1);
+        FsService.FsException e = assertThrows(FsService.FsException.class,
+                () -> fs.writeText("big", "slides/huge.tsx", huge));
+        assertEquals("TOO_LARGE", code(e));
+    }
+
+    @Test
+    void missingDeckOrFileIsNotFound() throws Exception {
+        fs.createDeck("present", deckFiles("P"));
+        FsService.FsException e = assertThrows(FsService.FsException.class,
+                () -> fs.readText("present", "slides/absent.tsx"));
+        assertEquals("NOT_FOUND", code(e));
+        FsService.FsException e2 = assertThrows(FsService.FsException.class,
+                () -> fs.readText("ghost", "deck.json"));
+        assertEquals("NOT_FOUND", code(e2));
+    }
+
+    @Test
+    void deleteRemovesTheFolderVerified() throws Exception {
+        fs.createDeck("gone", deckFiles("G"));
+        fs.writeText("gone", "slides/x.tsx", "// x");
+        JsonObject res = fs.deleteDeck("gone");
+        assertTrue(res.get("ok").getAsBoolean());
+        assertFalse(Files.exists(tempDir.resolve("decks/gone")));
+        FsService.FsException e = assertThrows(FsService.FsException.class,
+                () -> fs.readText("gone", "deck.json"));
+        assertEquals("NOT_FOUND", code(e));
+    }
+
+    @Test
+    void duplicatePatchesDeckJsonAndKeepsFiles() throws Exception {
+        fs.createDeck("orig", deckFiles("Original"));
+        fs.writeText("orig", "slides/s1.tsx", "// slide");
+        fs.writeText("orig", "assets/pic.png", "not really png");
+        JsonObject res = fs.duplicateDeck("orig", "copy", "Copy title");
+        assertTrue(res.get("ok").getAsBoolean());
+        assertEquals("copy", res.get("id").getAsString());
+        String json = fs.readText("copy", "deck.json").get("text").getAsString();
+        // duplicateDeck re-serializes with Gson pretty-printing — parse, don't substring-match
+        JsonObject patched = com.google.gson.JsonParser.parseString(json).getAsJsonObject();
+        assertEquals("copy", patched.get("id").getAsString());
+        assertEquals("Copy title", patched.get("title").getAsString());
+        assertEquals("// slide", fs.readText("copy", "slides/s1.tsx").get("text").getAsString());
+        assertEquals("not really png", fs.readText("copy", "assets/pic.png").get("text").getAsString());
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* listing + scan                                                       */
+    /* ------------------------------------------------------------------ */
+
+    @Test
+    void listDecksFindsOnlyRealDeckFolders() throws Exception {
+        fs.createDeck("alpha", deckFiles("Alpha"));
+        fs.createDeck("beta", deckFiles("Beta"));
+        Files.createDirectories(tempDir.resolve("decks/not-a-deck")); // no deck.json
+        Files.createDirectories(tempDir.resolve("decks/UPPER"));      // invalid id
+        JsonArray decks = fs.listDecks();
+        assertEquals(2, decks.size());
+        // beta was written last — the list is newest-first
+        assertEquals("beta", decks.get(0).getAsJsonObject().get("id").getAsString());
+        assertEquals("Beta", decks.get(0).getAsJsonObject().get("title").getAsString());
+    }
+
+    @Test
+    void listFilesWalksSubdirectories() throws Exception {
+        fs.createDeck("walk", deckFiles("W"));
+        fs.writeText("walk", "slides/a.tsx", "// a");
+        fs.writeText("walk", "notes/a.md", "# note");
+        JsonArray root = fs.listFiles("walk", "");
+        // root level: deck.json, theme.css, slides/, notes/
+        assertEquals(4, root.size());
+
+        JsonArray slides = fs.listFiles("walk", "slides");
+        assertEquals(1, slides.size());
+        assertEquals("a.tsx", slides.get(0).getAsJsonObject().get("name").getAsString());
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* root health (the "cannot save" guards)                              */
+    /* ------------------------------------------------------------------ */
+
+    @Test
+    void missingRootIsFolderMissing() throws Exception {
+        setRoot(tempDir.resolve("vanishing"));
+        Files.delete(tempDir.resolve("vanishing"));
+        FsService.FsException e = assertThrows(FsService.FsException.class, () -> fs.listDecks());
+        assertEquals("FOLDER_MISSING", code(e));
+    }
+
+    @Test
+    void unconfiguredRootIsFolderNotSet() throws Exception {
+        FsService fresh = new FsService(tempDir.resolve("unconfigured.json"));
+        FsService.FsException e = assertThrows(FsService.FsException.class, () -> fresh.listDecks());
+        assertEquals("FOLDER_NOT_SET", code(e));
+    }
+
+    @Test
+    void getRootIsValidatedWithoutThrowing() throws Exception {
+        setRoot(tempDir.resolve("gone-root"));
+        Files.delete(tempDir.resolve("gone-root"));
+        JsonObject root = fs.getRoot(); // never throws — it IS the health report
+        assertTrue(root.get("configured").getAsBoolean());
+        assertFalse(root.get("valid").getAsBoolean());
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* snapshot dir hygiene                                                 */
+    /* ------------------------------------------------------------------ */
+
+    @Test
+    void hiddenSnapshotFilesStayInsideTheDeck() throws Exception {
+        fs.createDeck("snaps", deckFiles("S"));
+        String payload = "{\"files\":{\"deck.json\":\"{}\"}}";
+        fs.writeText("snaps", ".stagesmith/snapshots/2024-01-01--before.json", payload);
+        String read = fs.readText("snaps", ".stagesmith/snapshots/2024-01-01--before.json")
+                .get("text").getAsString();
+        assertEquals(payload, read);
+    }
+}

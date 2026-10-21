@@ -131,7 +131,7 @@ public final class FsService {
         }
     }
 
-    private final Path configFile = AppConfig.USER_DIR.resolve("config.json");
+    private final Path configFile;
     private final Object lock = new Object();          // root + persisted config
     private final Object scanLock = new Object();      // deck list cache
     private Path root = null;
@@ -143,6 +143,12 @@ public final class FsService {
     private volatile Supplier<Window> dialogParent = () -> null;
 
     public FsService() {
+        this(AppConfig.USER_DIR.resolve("config.json"));
+    }
+
+    /** Test seam: an explicit config file location (temp dirs in unit tests). */
+    FsService(Path configFile) {
+        this.configFile = configFile;
         loadConfig();
     }
 
@@ -217,14 +223,22 @@ public final class FsService {
         }
     }
 
+    public JsonObject chooseRoot() throws FsException {
+        return chooseRoot(null, null, null);
+    }
+
     /**
      * Native folder chooser (JFileChooser on the Swing EDT — never on a JCEF
      * or pool thread). Cancelling returns the CURRENT persisted state cleanly
      * (no error, nothing changed). The first time a NEW folder is picked a
      * short confirmation asks the user to allow read/write access to it.
+     *
+     * <p>Web-supplied copy (Desktop Bridge Protocol v2): an optional dialog
+     * {@code title}, a {@code startPath} the chooser opens at when it still
+     * exists, and a one-line {@code hint} shown in the grant confirmation.</p>
      */
-    public JsonObject chooseRoot() throws FsException {
-        Path picked = pickFolderOnEdt();
+    public JsonObject chooseRoot(String title, String startPath, String hint) throws FsException {
+        Path picked = pickFolderOnEdt(title, startPath);
         if (picked == null) {
             return getRoot(); // user cancelled — clean, unchanged
         }
@@ -232,7 +246,7 @@ public final class FsService {
         String canonicalStr = canonical.toString();
         synchronized (lock) {
             boolean known = canonicalStr.equals(confirmedRoot);
-            if (!known && !confirmOnEdt(canonical)) {
+            if (!known && !confirmOnEdt(canonical, hint)) {
                 return getRoot(); // declined — unchanged
             }
             confirmedRoot = canonicalStr;
@@ -244,13 +258,13 @@ public final class FsService {
         return getRoot();
     }
 
-    private Path pickFolderOnEdt() throws FsException {
+    private Path pickFolderOnEdt(String title, String startPath) throws FsException {
         if (SwingUtilities.isEventDispatchThread()) {
-            return pickFolder(dialogParent.get());
+            return pickFolder(dialogParent.get(), title, startPath);
         }
         final Path[] out = new Path[1];
         try {
-            SwingUtilities.invokeAndWait(() -> out[0] = pickFolder(dialogParent.get()));
+            SwingUtilities.invokeAndWait(() -> out[0] = pickFolder(dialogParent.get(), title, startPath));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new FsException(CODE_CANCELLED, "folder selection was interrupted");
@@ -260,14 +274,28 @@ public final class FsService {
         return out[0];
     }
 
-    private Path pickFolder(Window parent) {
+    private Path pickFolder(Window parent, String title, String startPath) {
         JFileChooser fc = new JFileChooser();
-        fc.setDialogTitle("Choose your Chassé decks folder");
+        fc.setDialogTitle(title == null || title.isBlank()
+                ? "Choose your Chassé decks folder" : title);
         fc.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
         fc.setAcceptAllFileFilterUsed(false);
         Path current;
         synchronized (lock) {
             current = root;
+        }
+        // the web app's suggested start folder wins when it exists; otherwise
+        // the last chosen root; otherwise the system default location
+        if (startPath != null && !startPath.isBlank()) {
+            try {
+                Path sp = Path.of(startPath);
+                if (Files.isDirectory(sp)) {
+                    fc.setCurrentDirectory(sp.toFile());
+                    current = null;
+                }
+            } catch (Exception ignored) {
+                /* invalid start path — fall through to the persisted root */
+            }
         }
         if (current != null && Files.isDirectory(current)) {
             fc.setCurrentDirectory(current.toFile());
@@ -280,10 +308,14 @@ public final class FsService {
         return f == null ? null : f.toPath();
     }
 
-    private boolean confirmOnEdt(Path folder) {
+    private boolean confirmOnEdt(Path folder, String hint) {
         final boolean[] out = new boolean[1];
+        String message = (hint == null || hint.isBlank()
+                ? ""
+                : hint.trim() + "\n\n")
+                + "Allow Chasse Studio to read and write decks in this folder?\n\n" + folder;
         Runnable ask = () -> out[0] = JOptionPane.showConfirmDialog(dialogParent.get(),
-                "Allow Chasse Studio to read and write decks in this folder?\n\n" + folder,
+                message,
                 "Allow folder access", JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE)
                 == JOptionPane.YES_OPTION;
         if (SwingUtilities.isEventDispatchThread()) {

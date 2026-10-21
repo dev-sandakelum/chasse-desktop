@@ -47,7 +47,7 @@ import java.util.concurrent.Executors;
  */
 public final class DesktopBridge {
 
-    public static final String VERSION = "1.2.0";
+    public static final String VERSION = "1.3.0";
 
     private final AppConfig config;
     private final ServerManager servers;
@@ -71,6 +71,8 @@ public final class DesktopBridge {
 
     private volatile CefBrowser browser;
     private volatile String currentUrl = "";
+    /** native download support (set by Main) — serves the openDownloadFolder action */
+    private volatile DownloadBridge downloads;
 
     public DesktopBridge(org.cef.CefClient client, AppConfig config, ServerManager servers, SyncRooms rooms) {
         this(client, config, servers, rooms, null, null);
@@ -100,6 +102,11 @@ public final class DesktopBridge {
     /** The browser instance becomes available after creation in Main. */
     public void setBrowser(CefBrowser browser) {
         this.browser = browser;
+    }
+
+    /** The native download support (for the openDownloadFolder action). */
+    public void setDownloads(DownloadBridge downloads) {
+        this.downloads = downloads;
     }
 
     /* ------------------------------------------------------------------ */
@@ -308,6 +315,19 @@ public final class DesktopBridge {
                 data.addProperty("t", System.currentTimeMillis());
                 respondOk(callback, id, data);
             }
+            case "openDownloadFolder" -> {
+                DownloadBridge d = downloads;
+                if (d == null) {
+                    respondError(callback, id, "downloads are not available in this build");
+                    return;
+                }
+                // opens the folder of the LAST completed download of this session
+                // (or the configured downloads folder) — no arbitrary paths
+                boolean opened = d.openLastDownloadFolder();
+                JsonObject data = new JsonObject();
+                data.addProperty("ok", opened);
+                respondOk(callback, id, data);
+            }
             default -> respondError(callback, id, "unknown action");
         }
     }
@@ -330,6 +350,7 @@ public final class DesktopBridge {
             com.google.gson.JsonArray caps = new com.google.gson.JsonArray();
             caps.add("sync");
             caps.add("fs");
+            caps.add("downloads");
             o.add("capabilities", caps);
             callback.success(gson.toJson(o));
             return;
@@ -368,7 +389,8 @@ public final class DesktopBridge {
                 return fs.getRoot();
             }
             case "fs.chooseRoot" -> {
-                return fs.chooseRoot();
+                return fs.chooseRoot(optString(req, "title"),
+                        optString(req, "startPath"), optString(req, "hint"));
             }
             case "fs.listDecks" -> {
                 return fs.listDecks();
