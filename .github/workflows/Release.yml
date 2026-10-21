@@ -23,7 +23,9 @@ jobs:
 
       - name: Build & package
         shell: pwsh
-        run: ./scripts/package-windows.ps1
+        run: |
+          $ErrorActionPreference = "Stop"
+          ./scripts/package-windows.ps1
 
       - name: Zip app-image
         shell: pwsh
