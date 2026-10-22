@@ -230,6 +230,45 @@ class FsServiceTest {
     }
 
     @Test
+    void removeFromLibraryKeepsDeckFilesAndPreventsAutomaticReadoption() throws Exception {
+        fs.createDeck("kept", deckFiles("Kept"));
+        Path deckDir = tempDir.resolve("decks/kept");
+        String before = Files.readString(deckDir.resolve("deck.json"));
+
+        JsonObject result = fs.removeFromLibrary("kept");
+
+        assertTrue(result.get("ok").getAsBoolean());
+        assertTrue(result.get("filesKept").getAsBoolean());
+        assertEquals(deckDir.toString(), result.get("path").getAsString());
+        assertTrue(Files.isDirectory(deckDir));
+        assertEquals(before, Files.readString(deckDir.resolve("deck.json")));
+        assertEquals(0, fs.listDecks().size());
+        FsService.FsException e = assertThrows(FsService.FsException.class,
+                () -> fs.readText("kept", "deck.json"));
+        assertEquals("NOT_FOUND", code(e));
+    }
+
+    @Test
+    void catalogAllowsOnlyTheLinkedFolderOutsideTheDefaultRoot() throws Exception {
+        Path external = Files.createDirectories(tempDir.resolve("external/Linked Folder"));
+        Files.writeString(external.resolve("deck.json"), deckFiles("Linked").get("deck.json").getAsString());
+        JsonObject catalog = new JsonObject();
+        JsonArray decks = new JsonArray();
+        JsonObject entry = new JsonObject();
+        entry.addProperty("id", "linked");
+        entry.addProperty("folder", external.toRealPath().toString());
+        decks.add(entry);
+        catalog.add("decks", decks);
+        catalog.add("removedFolders", new JsonArray());
+        Files.writeString(tempDir.resolve("catalog.json"), catalog.toString());
+        fs = new FsService(tempDir.resolve("config.json"));
+
+        assertEquals("Linked", fs.listDecks().get(0).getAsJsonObject().get("title").getAsString());
+        fs.writeText("linked", "slides/linked.tsx", "export default null");
+        assertEquals("export default null", Files.readString(external.resolve("slides/linked.tsx")));
+    }
+
+    @Test
     void duplicatePatchesDeckJsonAndKeepsFiles() throws Exception {
         fs.createDeck("orig", deckFiles("Original"));
         fs.writeText("orig", "slides/s1.tsx", "// slide");

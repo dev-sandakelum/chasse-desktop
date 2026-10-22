@@ -412,6 +412,22 @@ public final class DesktopBridge {
             case "fs.deleteDeck" -> {
                 return fs.deleteDeck(requireParam(req, "deck"));
             }
+            case "fs.chooseDeckFolder" -> {
+                return fs.chooseDeckFolder(optString(req, "title"), optString(req, "startPath"));
+            }
+            case "fs.confirmAddDecks" -> {
+                JsonElement tokens = req.get("tokens");
+                if (tokens == null || !tokens.isJsonArray()) {
+                    throw new FsService.FsException(FsService.CODE_BAD_REQUEST, "tokens array is required");
+                }
+                return fs.confirmAddDecks(tokens.getAsJsonArray());
+            }
+            case "fs.relinkDeck" -> {
+                return fs.chooseDeckFolder(requireParam(req, "id"), optString(req, "title"), optString(req, "startPath"));
+            }
+            case "fs.removeDeck" -> {
+                return fs.removeFromLibrary(requireParam(req, "id"));
+            }
             case "fs.duplicateDeck" -> {
                 return fs.duplicateDeck(requireParam(req, "deck"), optString(req, "copyId"),
                         optString(req, "title"));

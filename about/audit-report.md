@@ -4,6 +4,23 @@ Audit date: 2026-10-21 · Audited against HEAD `d07979552bcc117be44718c52fb4a7e3
 
 This is the report of the full audit + repair pass described in `about/`. The sibling web repo (`presentation-2`) has its own `about/audit-report.md` covering the web side; the bridge contract is identical in both.
 
+## Follow-up — 2026-10-22
+
+Finding: the web UI had implementations for `fs.chooseDeckFolder`,
+`fs.confirmAddDecks`, `fs.relinkDeck`, and `fs.removeDeck`, but `DesktopBridge`
+did not dispatch any of them. `FsService` now persists an atomic catalog beside
+its config, accepts folders only from a Swing native chooser, issues expiring
+server-side scan tokens for multi-deck confirmation, and treats removal as a
+catalog/tombstone update that never touches deck files. The catalog grants file
+access to linked folders outside the default root; removed default-root folders
+are not automatically adopted again.
+
+Verification: all production and JUnit test sources compile with
+`javac --release 17`; the production compilation is clean. `mvn test` cannot
+run here because Maven is unavailable. The web repository's full `npm run
+lint` passes; its Bun-based bridge/E2E scripts and the native chooser still
+need their respective runtime checks.
+
 ---
 
 ## 1. What was found

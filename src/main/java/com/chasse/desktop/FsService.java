@@ -25,11 +25,15 @@ import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -132,12 +136,20 @@ public final class FsService {
     }
 
     private final Path configFile;
+    private final Path catalogFile;
     private final Object lock = new Object();          // root + persisted config
     private final Object scanLock = new Object();      // deck list cache
     private Path root = null;
     private String confirmedRoot = null;
     private List<DeckEntry> cache = new ArrayList<>();
     private long lastScan = 0;
+    /** Catalog entries are the only permission grant for folders outside root. */
+    private final Map<String, Path> catalog = new LinkedHashMap<>();
+    /** Canonical paths explicitly removed from the library are never re-adopted. */
+    private final Set<String> removedFolders = new HashSet<>();
+    private final Map<String, Path> pendingCandidates = new HashMap<>();
+    private long pendingCandidatesAt = 0;
+    private final AtomicBoolean chooserOpen = new AtomicBoolean(false);
 
     /** Lazily dereferenced parent window for the native dialogs (set by Main). */
     private volatile Supplier<Window> dialogParent = () -> null;
@@ -149,7 +161,9 @@ public final class FsService {
     /** Test seam: an explicit config file location (temp dirs in unit tests). */
     FsService(Path configFile) {
         this.configFile = configFile;
+        this.catalogFile = configFile.resolveSibling("catalog.json");
         loadConfig();
+        loadCatalog();
     }
 
     /** Parent window for dialogs; dereferenced only when a dialog opens. */
@@ -195,6 +209,52 @@ public final class FsService {
             atomicWriteBytes(configFile, o.toString().getBytes(StandardCharsets.UTF_8));
         } catch (IOException e) {
             System.err.println("[fs] could not save " + configFile + ": " + e.getMessage());
+        }
+    }
+
+    private void loadCatalog() {
+        try {
+            if (!Files.isRegularFile(catalogFile)) return;
+            JsonObject source = JsonParser.parseString(Files.readString(catalogFile, StandardCharsets.UTF_8)).getAsJsonObject();
+            JsonElement decks = source.get("decks");
+            if (decks != null && decks.isJsonArray()) {
+                for (JsonElement item : decks.getAsJsonArray()) {
+                    if (!item.isJsonObject()) continue;
+                    JsonObject entry = item.getAsJsonObject();
+                    String id = entry.has("id") ? entry.get("id").getAsString() : null;
+                    String folder = entry.has("folder") ? entry.get("folder").getAsString() : null;
+                    if (id != null && folder != null && DECK_ID.matcher(id).matches()) catalog.put(id, Path.of(folder));
+                }
+            }
+            JsonElement removed = source.get("removedFolders");
+            if (removed != null && removed.isJsonArray()) {
+                for (JsonElement item : removed.getAsJsonArray()) if (item.isJsonPrimitive()) removedFolders.add(item.getAsString());
+            }
+        } catch (Exception e) {
+            System.err.println("[fs] could not read " + catalogFile + ": " + e.getMessage());
+        }
+    }
+
+    private void saveCatalog() throws FsException {
+        JsonObject out = new JsonObject();
+        JsonArray decks = new JsonArray();
+        synchronized (lock) {
+            for (Map.Entry<String, Path> entry : catalog.entrySet()) {
+                JsonObject deck = new JsonObject();
+                deck.addProperty("id", entry.getKey());
+                deck.addProperty("folder", entry.getValue().toString());
+                decks.add(deck);
+            }
+            out.add("decks", decks);
+            JsonArray removed = new JsonArray();
+            for (String folder : removedFolders) removed.add(folder);
+            out.add("removedFolders", removed);
+        }
+        try {
+            Files.createDirectories(catalogFile.getParent());
+            atomicWriteBytes(catalogFile, out.toString().getBytes(StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            throw ioOf(e, "write library catalog");
         }
     }
 
@@ -361,15 +421,31 @@ public final class FsService {
 
     /** The deck's folder — must exist and contain deck.json. */
     private Path requireDeckDir(String deck) throws FsException {
-        Path r = requireRootValid();
         if (deck == null || !DECK_ID.matcher(deck).matches()) {
             throw new FsException(CODE_BAD_REQUEST, "Invalid deck id");
         }
-        Path dir = r.resolve(deck);
+        Path dir;
+        synchronized (lock) {
+            dir = catalog.get(deck);
+        }
+        if (dir == null) {
+            Path r = requireRootValid();
+            dir = r.resolve(deck);
+            String canonical = dir.toAbsolutePath().normalize().toString();
+            synchronized (lock) {
+                if (removedFolders.contains(canonical)) {
+                    throw new FsException(CODE_NOT_FOUND, "Deck was removed from the library: " + deck);
+                }
+            }
+        }
         if (!Files.isDirectory(dir) || !Files.isRegularFile(dir.resolve("deck.json"))) {
             throw new FsException(CODE_NOT_FOUND, "Deck not found: " + deck);
         }
-        return dir;
+        try {
+            return dir.toRealPath();
+        } catch (IOException e) {
+            throw ioOf(e, "access deck " + deck);
+        }
     }
 
     /** Same-folder validation used by the HTTP read path (deck must exist). */
@@ -514,7 +590,7 @@ public final class FsService {
     }
 
     private void rescanLocked(Path r) throws FsException {
-        List<DeckEntry> out = new ArrayList<>();
+        Map<String, DeckEntry> out = new LinkedHashMap<>();
         try (DirectoryStream<Path> ds = Files.newDirectoryStream(r)) {
             for (Path p : ds) {
                 // symlinked folders are skipped: a deck folder must be a REAL
@@ -531,14 +607,36 @@ public final class FsService {
                 if (!Files.isRegularFile(deckJson)) {
                     continue;
                 }
-                out.add(readEntry(name, p, deckJson));
+                String canonical = p.toRealPath().toString();
+                String id = deckIdForFolder(p, name);
+                synchronized (lock) {
+                    if (removedFolders.contains(canonical)) continue;
+                    Path known = catalog.get(id);
+                    if (known != null && !known.toAbsolutePath().normalize().equals(p.toRealPath())) continue;
+                    catalog.putIfAbsent(id, p.toRealPath());
+                }
+                out.put(id, readEntry(id, p, deckJson));
             }
         } catch (IOException e) {
             throw new FsException(CODE_IO_ERROR, "could not scan the decks folder: " + e.getMessage());
         }
-        out.sort(Comparator.comparingLong((DeckEntry e) -> e.modifiedMs).reversed());
-        cache = out;
+        synchronized (lock) {
+            for (Map.Entry<String, Path> entry : catalog.entrySet()) {
+                Path folder = entry.getValue();
+                try {
+                    if (Files.isDirectory(folder) && Files.isRegularFile(folder.resolve("deck.json"))) {
+                        out.put(entry.getKey(), readEntry(entry.getKey(), folder, folder.resolve("deck.json")));
+                    }
+                } catch (Exception ignored) {
+                    // Keep a missing catalog entry out of this response; file operations report its real error.
+                }
+            }
+        }
+        List<DeckEntry> sorted = new ArrayList<>(out.values());
+        sorted.sort(Comparator.comparingLong((DeckEntry e) -> e.modifiedMs).reversed());
+        cache = sorted;
         lastScan = System.currentTimeMillis();
+        saveCatalog();
     }
 
     private DeckEntry readEntry(String id, Path dir, Path deckJson) {
@@ -574,6 +672,22 @@ public final class FsService {
             // falls back to the folder name); reads/writes surface real errors
         }
         return new DeckEntry(id, title, dir.toString(), slides, modified, modifiedMs);
+    }
+
+    /** Uses deck.json's id for linked folders; the folder name is only the
+     * legacy/default-root fallback. This permits folders with spaces and
+     * non-English names without widening the bridge's deck-id protocol. */
+    private String deckIdForFolder(Path folder, String fallback) throws FsException {
+        try {
+            JsonObject deck = JsonParser.parseString(Files.readString(folder.resolve("deck.json"), StandardCharsets.UTF_8))
+                    .getAsJsonObject();
+            JsonElement id = deck.get("id");
+            if (id != null && id.isJsonPrimitive() && DECK_ID.matcher(id.getAsString()).matches()) return id.getAsString();
+        } catch (Exception ignored) {
+            // readEntry retains the established tolerant handling for malformed metadata.
+        }
+        if (DECK_ID.matcher(fallback).matches()) return fallback;
+        throw new FsException(CODE_BAD_REQUEST, "deck.json must contain a valid deck id");
     }
 
     /* ------------------------------------------------------------------ */
@@ -695,10 +809,164 @@ public final class FsService {
     public JsonObject deleteDeck(String deck) throws FsException {
         Path dir = requireDeckDir(deck);
         deleteTreeVerified(dir);
+        synchronized (lock) {
+            catalog.remove(deck);
+        }
+        saveCatalog();
         invalidateCache();
         JsonObject o = new JsonObject();
         o.addProperty("ok", true);
         return o;
+    }
+
+    /**
+     * Opens a native folder chooser and adds only the chosen deck folder to the
+     * catalog. The page never submits a path: nested results must be confirmed
+     * with short-lived tokens created by this method.
+     */
+    public JsonObject chooseDeckFolder(String title, String startPath) throws FsException {
+        return chooseDeckFolder(null, title, startPath);
+    }
+
+    /** Re-links an existing catalog id when {@code relinkId} is non-null. */
+    public JsonObject chooseDeckFolder(String relinkId, String title, String startPath) throws FsException {
+        if (!chooserOpen.compareAndSet(false, true)) {
+            throw new FsException("BUSY", "A folder chooser is already open");
+        }
+        try {
+            Path chosen = pickFolderOnEdt(title, startPath);
+            if (chosen == null) {
+                JsonObject cancelled = new JsonObject();
+                cancelled.addProperty("cancelled", true);
+                return cancelled;
+            }
+            Path folder;
+            try {
+                folder = chosen.toRealPath();
+            } catch (IOException e) {
+                throw new FsException("NOT_READABLE", "Could not read the selected folder: " + e.getMessage());
+            }
+            if (!Files.isReadable(folder)) throw new FsException("NOT_READABLE", "The selected folder is not readable");
+            if (Files.isRegularFile(folder.resolve("deck.json"))) {
+                return addChosenDeck(folder, relinkId);
+            }
+            List<Path> candidates = new ArrayList<>();
+            try (DirectoryStream<Path> children = Files.newDirectoryStream(folder)) {
+                for (Path child : children) {
+                    if (Files.isDirectory(child) && Files.isRegularFile(child.resolve("deck.json"))) candidates.add(child.toRealPath());
+                }
+            } catch (IOException e) {
+                throw new FsException("NOT_READABLE", "Could not inspect the selected folder: " + e.getMessage());
+            }
+            if (candidates.isEmpty()) throw new FsException("NO_DECK_JSON", "This folder doesn't contain a deck.json file");
+            JsonArray listed = new JsonArray();
+            synchronized (lock) {
+                pendingCandidates.clear();
+                pendingCandidatesAt = System.currentTimeMillis();
+                for (Path candidate : candidates) {
+                    String token = UUID.randomUUID().toString();
+                    pendingCandidates.put(token, candidate);
+                    DeckEntry entry = readEntry(candidate.getFileName().toString(), candidate, candidate.resolve("deck.json"));
+                    JsonObject item = new JsonObject();
+                    item.addProperty("token", token);
+                    item.addProperty("title", entry.title);
+                    item.addProperty("folder", candidate.toString());
+                    item.addProperty("slides", entry.slides);
+                    listed.add(item);
+                }
+            }
+            JsonObject result = new JsonObject();
+            result.addProperty("needsConfirm", true);
+            result.add("candidates", listed);
+            return result;
+        } finally {
+            chooserOpen.set(false);
+        }
+    }
+
+    public JsonObject confirmAddDecks(JsonArray tokens) throws FsException {
+        if (tokens == null || tokens.size() == 0) throw bad("tokens are required");
+        List<Path> selected = new ArrayList<>();
+        synchronized (lock) {
+            if (System.currentTimeMillis() - pendingCandidatesAt > 5 * 60_000L) {
+                pendingCandidates.clear();
+                throw new FsException(CODE_BAD_REQUEST, "The folder scan expired; choose the folder again");
+            }
+            for (JsonElement token : tokens) {
+                if (!token.isJsonPrimitive()) throw bad("invalid deck token");
+                Path path = pendingCandidates.get(token.getAsString());
+                if (path == null) throw bad("unknown deck token");
+                selected.add(path);
+            }
+            pendingCandidates.clear();
+        }
+        JsonArray added = new JsonArray();
+        for (Path path : selected) {
+            JsonObject result = addChosenDeck(path, null);
+            JsonElement entries = result.get("added");
+            if (entries != null && entries.isJsonArray()) for (JsonElement entry : entries.getAsJsonArray()) added.add(entry);
+        }
+        JsonObject result = new JsonObject();
+        result.addProperty("ok", true);
+        result.add("added", added);
+        return result;
+    }
+
+    public JsonObject removeFromLibrary(String deck) throws FsException {
+        Path folder;
+        synchronized (lock) {
+            folder = catalog.get(deck);
+            if (folder == null) {
+                Path r = requireRootValid();
+                folder = r.resolve(deck);
+            }
+            catalog.remove(deck);
+            removedFolders.add(folder.toAbsolutePath().normalize().toString());
+        }
+        saveCatalog();
+        invalidateCache();
+        JsonObject result = new JsonObject();
+        result.addProperty("ok", true);
+        result.addProperty("filesKept", true);
+        result.addProperty("path", folder.toString());
+        return result;
+    }
+
+    private JsonObject addChosenDeck(Path folder, String relinkId) throws FsException {
+        String scannedId = deckIdForFolder(folder, folder.getFileName().toString());
+        DeckEntry metadata = readEntry(scannedId, folder, folder.resolve("deck.json"));
+        String id = relinkId == null ? scannedId : relinkId;
+        if (!DECK_ID.matcher(id).matches()) throw bad("Deck id in deck.json is invalid");
+        synchronized (lock) {
+            for (Map.Entry<String, Path> entry : catalog.entrySet()) {
+                if (entry.getValue().toAbsolutePath().normalize().equals(folder.toAbsolutePath().normalize()) && !entry.getKey().equals(id)) {
+                    JsonObject duplicate = new JsonObject();
+                    duplicate.addProperty("alreadyInLibrary", true);
+                    return duplicate;
+                }
+            }
+            if (catalog.containsKey(id) && relinkId == null) {
+                JsonObject duplicate = new JsonObject();
+                duplicate.addProperty("alreadyInLibrary", true);
+                return duplicate;
+            }
+            catalog.put(id, folder);
+            removedFolders.remove(folder.toAbsolutePath().normalize().toString());
+        }
+        saveCatalog();
+        invalidateCache();
+        JsonObject entry = new JsonObject();
+        entry.addProperty("id", id);
+        entry.addProperty("title", metadata.title);
+        entry.addProperty("folder", folder.getFileName().toString());
+        entry.addProperty("path", folder.toString());
+        entry.addProperty("slides", metadata.slides);
+        JsonArray added = new JsonArray();
+        added.add(entry);
+        JsonObject result = new JsonObject();
+        result.addProperty("ok", true);
+        result.add("added", added);
+        return result;
     }
 
     /**
