@@ -121,8 +121,19 @@ public final class LoopbackFileServer {
             return;
         }
 
-        // (2) Origin — when a browser sends one it must be the trusted app
-        // origin (image/CSS subresource loads send none and rely on the token)
+        // Validate the bearer path before answering OPTIONS. Sandboxed stage
+        // iframes have an opaque origin, so Chromium sends Origin: null for
+        // CORS/PNA requests; the session token remains the authorization.
+        String rawPath = ex.getRequestURI().getRawPath();
+        String[] segs = rawPath.isEmpty() ? new String[0] : rawPath.substring(1).split("/");
+        if (segs.length < 2 || !MessageDigest.isEqual(token.getBytes(StandardCharsets.US_ASCII),
+                segs[0].getBytes(StandardCharsets.US_ASCII))) {
+            respondJson(ex, 404, "NOT_FOUND", "not found");
+            return;
+        }
+
+        // (2) Origin — trusted app pages and its sandboxed opaque-origin
+        // stage iframe are allowed. Other origins still need the secret token.
         String origin = ex.getRequestHeaders().getFirst("Origin");
         boolean cors = origin != null && !origin.isEmpty();
         if (cors && !originAllowed(origin)) {
@@ -135,15 +146,7 @@ public final class LoopbackFileServer {
             return;
         }
 
-        // (3) token + path shape: /<token>/<deck>/<path...>
-        String rawPath = ex.getRequestURI().getRawPath();
-        String[] segs = rawPath.isEmpty() ? new String[0] : rawPath.substring(1).split("/");
-        if (segs.length < 2 || !MessageDigest.isEqual(token.getBytes(StandardCharsets.US_ASCII),
-                segs[0].getBytes(StandardCharsets.US_ASCII))) {
-            // wrong token → indistinguishable from "nothing here"
-            respondJson(ex, 404, "NOT_FOUND", "not found");
-            return;
-        }
+        // (3) token + path shape was checked before CORS/preflight handling.
         String deck;
         String rel;
         try {
@@ -426,6 +429,7 @@ public final class LoopbackFileServer {
                 acrh != null && !acrh.isBlank() ? acrh : "Content-Type");
         ex.getResponseHeaders().set("Access-Control-Max-Age", "600");
         ex.getResponseHeaders().set("Vary", "Origin");
+        ex.getResponseHeaders().set("Cross-Origin-Resource-Policy", "cross-origin");
         // Chromium's Private Network Access: public https page → loopback
         if ("true".equalsIgnoreCase(ex.getRequestHeaders().getFirst("Access-Control-Request-Private-Network"))) {
             ex.getResponseHeaders().set("Access-Control-Allow-Private-Network", "true");
@@ -440,6 +444,7 @@ public final class LoopbackFileServer {
     }
 
     private void addCors(HttpExchange ex, String origin) {
+        ex.getResponseHeaders().set("Cross-Origin-Resource-Policy", "cross-origin");
         if (origin != null && originAllowed(origin)) {
             ex.getResponseHeaders().set("Access-Control-Allow-Origin", origin);
             ex.getResponseHeaders().set("Vary", "Origin");
@@ -463,6 +468,9 @@ public final class LoopbackFileServer {
     private boolean originAllowed(String origin) {
         if (trustedOrigin == null || origin == null) {
             return false;
+        }
+        if ("null".equals(origin.trim())) {
+            return true; // the embedded StageFrame iframe is sandboxed/opaque
         }
         return trustedOrigin.equalsIgnoreCase(origin.trim());
     }
