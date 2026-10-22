@@ -729,6 +729,7 @@ public final class FsService {
             throw bad("refusing to write through a symbolic link: " + path);
         }
         try {
+            backupBeforeWrite(dir, file, path);
             atomicWriteBytes(file, bytes);
         } catch (IOException e) {
             throw ioOf(e, "write " + path);
@@ -737,6 +738,26 @@ public final class FsService {
         JsonObject o = new JsonObject();
         o.addProperty("ok", true);
         return o;
+    }
+
+    private void backupBeforeWrite(Path deckDir, Path file, String rel) throws IOException {
+        if (!Files.isRegularFile(file)) return;
+        Path history = deckDir.resolve(".history");
+        Path snapshot = history.resolve(System.currentTimeMillis() + "-" + java.util.UUID.randomUUID());
+        Path copy = resolveConfined(snapshot, rel);
+        Files.createDirectories(copy.getParent());
+        copyFileAtomic(file, copy);
+        try (var entries = Files.list(history)) {
+            for (Path old : entries.filter(Files::isDirectory)
+                    .sorted(Comparator.comparingLong(FsService::lastModified).reversed())
+                    .skip(10).toList()) {
+                deleteTreeBestEffort(old);
+            }
+        }
+    }
+
+    private static long lastModified(Path path) {
+        try { return Files.getLastModifiedTime(path).toMillis(); } catch (IOException ignored) { return 0; }
     }
 
     /* ------------------------------------------------------------------ */
