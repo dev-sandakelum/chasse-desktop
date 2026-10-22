@@ -1,8 +1,7 @@
 # Chassé Studio — Web ↔ Java Bridge Contract
 
-Version **1.3.0** · This file is **identical** in both repos (`chasse-desktop/about/CONTRACT.md`
-and `presentation-2/about/CONTRACT.md`). If the code and this contract differ,
-fix the code or this file so there is one truth.
+Version **1.4.0** · Java-side bridge contract. The web integration copy lives
+at `presentation-2/about/CONTRACT.md`.
 
 ---
 
@@ -87,7 +86,7 @@ and return `{code: "FORBIDDEN", message: "…"}` otherwise.
 
 | Command | Params | Success shape | Notes |
 |---|---|---|---|
-| `hello` | — | `{app: "chasse-desktop", version: "1.3.0", capabilities: ["sync","fs","downloads"]}` | Available to untrusted pages |
+| `hello` | — | `{app: "chasse-desktop", version: "1.4.0", capabilities: ["sync","fs","downloads","assetUrls"]}` | Available to untrusted pages |
 | `fs.getRoot` | — | `{configured: bool, path: string, valid: bool}` | Never throws; it is the health report |
 | `fs.chooseRoot` | `{title?, startPath?, hint?}` | `{cancelled: true}` OR `{configured, path, valid}` | Cancel is a clean answer, not an error; shows native folder chooser on Swing EDT |
 | `fs.listDecks` | — | `[{id, title, folder, slides, modified}]` | Sorted by modified descending |
@@ -102,7 +101,11 @@ and return `{code: "FORBIDDEN", message: "…"}` otherwise.
 | `fs.duplicateDeck` | `{deck, copyId, title?}` | `{ok: true, id: string}` | Patches `deck.json` (id/title/modified); deck.json written last |
 | `fs.listFiles` | `{deck, dir?}` | `[{name, directory, size, modified}]` | One directory level; `modified` is epoch ms |
 | `fs.delete` | `{deck, path}` | `{ok: true}` | File or folder (recursive); verified gone |
-| `fs.fileUrl` | `{deck, path}` | `{url: "http://127.0.0.1:<port>/<token>/…"}` | Assets GET; uploads PUT; loopback only |
+| `fs.readAssetBase64` | `{deck, path}` | `{base64}` | Compatibility fallback only; images up to 8 MiB |
+| `fs.beginAssetUpload` | `{deck, path}` | `{uploadId}` | Creates a same-folder temporary upload |
+| `fs.writeAssetChunk` | `{uploadId, base64}` | `{size}` | Appends one bounded chunk; total upload limit 256 MiB |
+| `fs.finishAssetUpload` | `{uploadId}` | `{ok:true, size}` | Atomically renames the completed temporary file |
+| `fs.abortAssetUpload` | `{uploadId}` | `{ok:true}` | Closes and deletes the temporary file |
 
 ### Error Codes
 
@@ -135,6 +138,33 @@ and return `{code: "FORBIDDEN", message: "…"}` otherwise.
 - Canonical `toRealPath()` containment check after lexical validation (symlinks
   and junctions that escape the deck folder are rejected)
 - Symlink write targets (`fs.writeText`, HTTP PUT) are refused outright
+
+## Same-origin asset interception (`assetUrls`)
+
+When `hello.capabilities` includes `assetUrls`, desktop assets use the virtual
+same-origin path `/__chasse_files__/<encoded-deck-id>/<encoded-relative-path>`.
+JCEF's `CefRequestHandler.getResourceRequestHandler()` and
+`CefResourceRequestHandler.getResourceHandler()` intercept this prefix before
+network loading. Other paths pass through untouched.
+
+Only frames whose URL origin matches the request origin and is either the
+configured hosted app origin or localhost/127.0.0.1:3000 are served. Java
+resolves the deck through the catalog and re-confines each decoded relative
+path with `FsService`. File reads are chunked on a worker pool; responses
+include MIME type, Content-Length, ETag, Last-Modified and single-range support.
+Every intercepted request logs path, status, bytes and elapsed milliseconds.
+
+HTTP statuses: 200/206 success, 304 unchanged, 403 untrusted origin or unsafe
+path, 404 missing deck/file, 405 unsupported method, 416 invalid range, 500
+unexpected I/O. Error responses include `X-Chasse-Error-Code`: `FORBIDDEN`,
+`BAD_REQUEST`, `NOT_FOUND`, or `IO_ERROR`.
+
+Uploads use `fs.beginAssetUpload`, `fs.writeAssetChunk`, and
+`fs.finishAssetUpload`; chunks are streamed into a temporary file and the final
+path is atomically renamed after revalidation. The web client sends at most
+256 KiB per command; total upload limit is 256 MiB. `fs.readAssetBase64` supports
+the compatibility image fallback up to 8 MiB. No file listener or custom
+scheme is used for assets.
 
 ---
 
@@ -251,51 +281,12 @@ attempts) and immediately on `visibilitychange`.
 
 ---
 
-## Loopback File Server HTTP Protocol
-
-URL shape: `http://127.0.0.1:<port>/<session-token>/<deck>/<path…>`
-
-Every segment (deck id, path segments) is percent-encoded per
-[RFC 3986](https://www.rfc-editor.org/rfc/rfc3986) unreserved chars. Spaces
-and non-ASCII characters round-trip correctly.
-
-### GET / HEAD — serve a file
-
-Success: HTTP 200/206 with `Content-Type`, `ETag`, `Accept-Ranges`,
-`Cache-Control: private, max-age=60`. Supports `Range` (single range),
-`If-None-Match` (→ 304).
-
-### PUT — upload / update a file
-
-Body: raw binary body (≤ 256 MiB). Uploaded via temp file → fsync → atomic
-rename. Returns `{ok: true, size: <bytes>}`.
-
-### Security checks (per request, in order)
-
-1. **Host** must be `127.0.0.1:<port>` or `localhost:<port>` (stops DNS
-   rebinding).
-2. **Origin** (when present) must equal the trusted app origin (stops
-   cross-origin page abuse).
-3. **Token** segment compared constant-time (`MessageDigest.isEqual`); wrong
-   token returns HTTP 404 (indistinguishable from "nothing here").
-4. **Path re-confinement** by `FsService` (lexical + canonical; symlink write
-   targets refused).
-5. **Size limit** enforced while streaming (413 on `Content-Length` precheck
-   and during the read).
-
-`OPTIONS` preflight echoes the allowed methods/headers for the trusted origin
-and answers Chromium's Private Network Access check
-(`Access-Control-Allow-Private-Network: true`), required when the public HTTPS
-page fetches loopback resources.
-
----
-
 ## Versioning
 
-- Bridge protocol version `1.3.0` is advertised by `hello.version` and
+- Bridge protocol version `1.4.0` is advertised by `hello.version` and
   `getBridgeInfo.version`.
 - The web app must handle older builds gracefully (see Compatibility section
   above).
 - When adding a new command or action, bump the version in both repos and
-  update both copies of this file in the same change.
+  update both integration contracts in the same change.
 - Error codes must never be renamed (add new ones, keep old ones).

@@ -207,17 +207,8 @@ public final class Main {
             servers.log("info", "Loading " + config.appUrl());
             CefClient client = cefApp.createClient();
 
-            // 4. bridge (+ the fs capability: decks-folder owner + loopback
-            //    file server for assets/uploads — Desktop Bridge Protocol v2)
+            // 4. bridge + same-origin virtual asset interception.
             final FsService fsService = new FsService();
-            LoopbackFileServer fileServer = null;
-            try {
-                fileServer = new LoopbackFileServer(fsService, config);
-                fileServer.start();
-            } catch (IOException e) {
-                servers.log("error", "Could not start the deck file server: " + e.getMessage());
-            }
-            final LoopbackFileServer fileServerFinal = fileServer;
             fsService.setDialogParent(() -> frameRef.get() == null ? null : frameRef.get());
             com.google.gson.JsonObject rootInfo = fsService.getRoot();
             servers.log("info", "Decks folder: "
@@ -225,10 +216,8 @@ public final class Main {
                         ? rootInfo.get("path").getAsString()
                             + (rootInfo.get("valid").getAsBoolean() ? " (ready)" : " (missing — the app will ask to choose again)")
                         : "not chosen yet"));
-            if (fileServer != null) {
-                servers.log("info", "Deck file server on 127.0.0.1:" + fileServer.port() + " (loopback only)");
-            }
-            DesktopBridge bridge = new DesktopBridge(client, config, servers, rooms, fsService, fileServerFinal);
+            DesktopBridge bridge = new DesktopBridge(client, config, servers, rooms, fsService);
+            client.addRequestHandler(new AssetRequestHandler(fsService, config));
 
             // the native UX the embedded window cannot provide on its own:
             // downloads (Save-as + progress events to the page), JS dialogs
@@ -257,7 +246,6 @@ public final class Main {
 
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 try { servers.stop(); } catch (Exception ignored) {}
-                try { if (fileServerFinal != null) fileServerFinal.stop(); } catch (Exception ignored) {}
             }));
 
             // 6. Swing window — undecorated so the OS title bar is gone

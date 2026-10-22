@@ -13,6 +13,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.channels.FileChannel;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.DirectoryStream;
@@ -21,6 +22,7 @@ import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
@@ -34,6 +36,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.UUID;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -78,7 +82,7 @@ public final class FsService {
     public static final String CODE_UNKNOWN_CMD = "UNKNOWN_CMD";
 
     /** Contract limits. Text commands carry whole files as JSON strings, so
-     *  they get a small limit; uploads stream through the loopback server and
+     *  they get a small limit; uploads stream through bounded bridge chunks and
      *  get a generous one. */
     public static final long MAX_TEXT_BYTES = 2L * 1024 * 1024;        // 2 MiB
     public static final long MAX_UPLOAD_BYTES = 256L * 1024 * 1024;    // 256 MiB
@@ -150,6 +154,18 @@ public final class FsService {
     private final Map<String, Path> pendingCandidates = new HashMap<>();
     private long pendingCandidatesAt = 0;
     private final AtomicBoolean chooserOpen = new AtomicBoolean(false);
+    private final Map<String, AssetUpload> assetUploads = new ConcurrentHashMap<>();
+    private static final int MAX_ASSET_UPLOAD_SESSIONS = 8;
+    private static final long MAX_ASSET_UPLOAD_BYTES_TOTAL = 512L * 1024 * 1024;
+    private final java.util.concurrent.atomic.AtomicLong activeAssetUploadBytes = new java.util.concurrent.atomic.AtomicLong();
+
+    private static final class AssetUpload {
+        final String deck, relative;
+        final Path target, temp;
+        final java.io.OutputStream out;
+        long size;
+        AssetUpload(String deck, String relative, Path target, Path temp, java.io.OutputStream out) { this.deck=deck; this.relative=relative; this.target=target; this.temp=temp; this.out=out; }
+    }
 
     /** Lazily dereferenced parent window for the native dialogs (set by Main). */
     private volatile Supplier<Window> dialogParent = () -> null;
@@ -454,6 +470,82 @@ public final class FsService {
         return resolveConfined(dir, rel);
     }
 
+    /** Small-image compatibility fallback for desktop versions without virtual asset URLs. */
+    String readAssetBase64(String deck, String rel) throws FsException {
+        Path target = resolveHttpReadTarget(deck, rel);
+        try {
+            if (!Files.isRegularFile(target)) throw new FsException(CODE_NOT_FOUND, "File not found: " + rel);
+            long size = Files.size(target);
+            if (size > 8L * 1024 * 1024) throw new FsException(CODE_TOO_LARGE, "Update the desktop app to preview images larger than 8 MiB.");
+            return java.util.Base64.getEncoder().encodeToString(Files.readAllBytes(target));
+        } catch (FsException e) { throw e; }
+        catch (IOException e) { throw ioOf(e, "read " + rel); }
+    }
+
+    String beginAssetUpload(String deck, String rel) throws FsException {
+        if (assetUploads.size() >= MAX_ASSET_UPLOAD_SESSIONS) throw new FsException("BUSY", "Too many active asset uploads");
+        Path target = resolveHttpWriteTarget(deck, rel);
+        try {
+            Path parent = target.getParent(); if (parent != null) Files.createDirectories(parent);
+            Path temp = beginTempFile(parent == null ? target.toAbsolutePath().getParent() : parent);
+            String id = UUID.randomUUID().toString();
+            assetUploads.put(id, new AssetUpload(deck, rel, target, temp, Files.newOutputStream(temp)));
+            return id;
+        } catch (IOException e) { throw ioOf(e, "prepare upload " + rel); }
+    }
+
+    long writeAssetChunk(String id, String base64) throws FsException {
+        AssetUpload upload = assetUploads.get(id);
+        if (upload == null) throw new FsException(CODE_NOT_FOUND, "Upload session not found");
+        try {
+            byte[] bytes = java.util.Base64.getDecoder().decode(base64);
+            if (upload.size + bytes.length > MAX_UPLOAD_BYTES) throw new FsException(CODE_TOO_LARGE, "Upload exceeds 256 MiB");
+            synchronized (upload) {
+            long total = activeAssetUploadBytes.addAndGet(bytes.length);
+            if (total > MAX_ASSET_UPLOAD_BYTES_TOTAL) {
+                activeAssetUploadBytes.addAndGet(-bytes.length);
+                throw new FsException("BUSY", "Active uploads exceed the 512 MiB limit");
+            }
+            if (upload.size + bytes.length > MAX_UPLOAD_BYTES) {
+                activeAssetUploadBytes.addAndGet(-bytes.length);
+                throw new FsException(CODE_TOO_LARGE, "Upload exceeds 256 MiB");
+            }
+            try { upload.out.write(bytes); upload.size += bytes.length; return upload.size; }
+            catch (IOException e) { activeAssetUploadBytes.addAndGet(-bytes.length); throw e; }
+            }
+        } catch (FsException e) { throw e; }
+        catch (Exception e) { throw ioOf(e instanceof IOException io ? io : new IOException(e), "write upload chunk"); }
+    }
+
+    JsonObject finishAssetUpload(String id) throws FsException {
+        AssetUpload upload = assetUploads.remove(id);
+        if (upload == null) throw new FsException(CODE_NOT_FOUND, "Upload session not found");
+        try {
+            synchronized (upload) {
+            upload.out.close();
+            Path checked = resolveHttpWriteTarget(upload.deck, upload.relative);
+            if (!checked.equals(upload.target) || Files.isSymbolicLink(checked)) throw bad("upload path changed during write");
+            finishTempFile(upload.temp, checked); invalidateCache();
+            JsonObject result = new JsonObject(); result.addProperty("ok", true); result.addProperty("size", upload.size); return result;
+            }
+        } catch (FsException e) {
+            activeAssetUploadBytes.addAndGet(-upload.size);
+            try { Files.deleteIfExists(upload.temp); } catch (IOException ignored) {}
+            throw e;
+        } catch (IOException e) {
+            activeAssetUploadBytes.addAndGet(-upload.size);
+            try { Files.deleteIfExists(upload.temp); } catch (IOException ignored) {}
+            throw ioOf(e, "finish upload");
+        }
+    }
+
+    void abortAssetUpload(String id) {
+        AssetUpload upload = assetUploads.remove(id); if (upload == null) return;
+        activeAssetUploadBytes.addAndGet(-upload.size);
+        synchronized (upload) { try { upload.out.close(); } catch (IOException ignored) {} }
+        try { Files.deleteIfExists(upload.temp); } catch (IOException ignored) {}
+    }
+
     /** Resolve a write target inside an existing deck (used by HTTP PUT). */
     Path resolveHttpWriteTarget(String deck, String rel) throws FsException {
         Path dir = requireDeckDir(deck);
@@ -731,6 +823,8 @@ public final class FsService {
         try {
             backupBeforeWrite(dir, file, path);
             atomicWriteBytes(file, bytes);
+        } catch (FsException e) {
+            throw e;
         } catch (IOException e) {
             throw ioOf(e, "write " + path);
         }
@@ -740,7 +834,7 @@ public final class FsService {
         return o;
     }
 
-    private void backupBeforeWrite(Path deckDir, Path file, String rel) throws IOException {
+    private void backupBeforeWrite(Path deckDir, Path file, String rel) throws IOException, FsException {
         if (!Files.isRegularFile(file)) return;
         Path history = deckDir.resolve(".history");
         Path snapshot = history.resolve(System.currentTimeMillis() + "-" + java.util.UUID.randomUUID());
@@ -1053,7 +1147,7 @@ public final class FsService {
     }
 
     /* ------------------------------------------------------------------ */
-    /* fs.listFiles / fs.delete / fs.fileUrl                              */
+    /* fs.listFiles / fs.delete / asset reads                             */
     /* ------------------------------------------------------------------ */
 
     /** One directory level of a deck: [{name, size, modified, directory}]. */
@@ -1125,7 +1219,7 @@ public final class FsService {
     }
 
     /* ------------------------------------------------------------------ */
-    /* shared write helpers (also used by the loopback file server)        */
+    /* shared write helpers (atomic streamed asset upload)                */
     /* ------------------------------------------------------------------ */
 
     /**
@@ -1172,6 +1266,7 @@ public final class FsService {
     }
 
     static void finishTempFile(Path tmp, Path target) throws IOException {
+        try (FileChannel channel = FileChannel.open(tmp, StandardOpenOption.WRITE)) { channel.force(true); }
         try {
             Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         } catch (AtomicMoveNotSupportedException e) {

@@ -47,13 +47,12 @@ import java.util.concurrent.Executors;
  */
 public final class DesktopBridge {
 
-    public static final String VERSION = "1.3.0";
+    public static final String VERSION = "1.4.0";
 
     private final AppConfig config;
     private final ServerManager servers;
     private final SyncRooms rooms;
     private final FsService fs;
-    private final LoopbackFileServer fileServer;
     private final Gson gson = new Gson();
     /** Worker for server lifecycle calls (start/stop/restart block). */
     private final ExecutorService worker = Executors.newCachedThreadPool(r -> {
@@ -75,16 +74,15 @@ public final class DesktopBridge {
     private volatile DownloadBridge downloads;
 
     public DesktopBridge(org.cef.CefClient client, AppConfig config, ServerManager servers, SyncRooms rooms) {
-        this(client, config, servers, rooms, null, null);
+        this(client, config, servers, rooms, null);
     }
 
     public DesktopBridge(org.cef.CefClient client, AppConfig config, ServerManager servers, SyncRooms rooms,
-                         FsService fs, LoopbackFileServer fileServer) {
+                         FsService fs) {
         this.config = config;
         this.servers = servers;
         this.rooms = rooms;
         this.fs = fs;
-        this.fileServer = fileServer;
 
         CefMessageRouter router = CefMessageRouter.create(); // default: window.cefQuery
         router.addHandler(new QueryHandler(), false);
@@ -351,6 +349,7 @@ public final class DesktopBridge {
             caps.add("sync");
             caps.add("fs");
             caps.add("downloads");
+            caps.add("assetUrls");
             o.add("capabilities", caps);
             callback.success(gson.toJson(o));
             return;
@@ -398,6 +397,28 @@ public final class DesktopBridge {
             case "fs.readText" -> {
                 return fs.readText(requireParam(req, "deck"), requireParam(req, "path"));
             }
+            case "fs.readAssetBase64" -> {
+                JsonObject out = new JsonObject();
+                out.addProperty("base64", fs.readAssetBase64(requireParam(req, "deck"), requireParam(req, "path")));
+                return out;
+            }
+            case "fs.beginAssetUpload" -> {
+                JsonObject out = new JsonObject();
+                out.addProperty("uploadId", fs.beginAssetUpload(requireParam(req, "deck"), requireParam(req, "path")));
+                return out;
+            }
+            case "fs.writeAssetChunk" -> {
+                JsonObject out = new JsonObject();
+                out.addProperty("size", fs.writeAssetChunk(requireParam(req, "uploadId"), requireParam(req, "base64")));
+                return out;
+            }
+            case "fs.finishAssetUpload" -> {
+                return fs.finishAssetUpload(requireParam(req, "uploadId"));
+            }
+            case "fs.abortAssetUpload" -> {
+                fs.abortAssetUpload(requireParam(req, "uploadId"));
+                JsonObject out = new JsonObject(); out.addProperty("ok", true); return out;
+            }
             case "fs.writeText" -> {
                 return fs.writeText(requireParam(req, "deck"), requireParam(req, "path"),
                         optString(req, "text"));
@@ -437,17 +458,6 @@ public final class DesktopBridge {
             }
             case "fs.delete" -> {
                 return fs.delete(requireParam(req, "deck"), requireParam(req, "path"));
-            }
-            case "fs.fileUrl" -> {
-                String deck = requireParam(req, "deck");
-                String path = requireParam(req, "path");
-                if (fileServer == null) {
-                    throw new FsService.FsException(FsService.CODE_IO_ERROR, "file server is not running");
-                }
-                FsService.checkRelPath(path);
-                JsonObject o = new JsonObject();
-                o.addProperty("url", fileServer.urlFor(deck, path));
-                return o;
             }
             default -> throw new FsService.FsException(FsService.CODE_UNKNOWN_CMD, "unknown command: " + cmd);
         }

@@ -2,7 +2,7 @@
 
 All sources live in `src/main/java/com/chasse/desktop/`. One process, three
 transports: the web page over `window.cefQuery` (bridge), the phones over
-WebSocket, and the page's asset loads over a loopback HTTP server.
+WebSocket, and desktop assets through same-origin JCEF interception.
 
 ## Modules
 
@@ -13,7 +13,7 @@ WebSocket, and the page's asset loads over a loopback HTTP server.
 | `AppInstanceGuard.java` | Single-instance `FileLock` on `~/.chasse-studio/app.lock` |
 | `DesktopBridge.java` | The JCEF bridge: v1 actions + v2 cmds, origin trust, event push (protocol version 1.3.0) |
 | `FsService.java` | Owns the decks folder: confinement, atomic writes, limits, `config.json` |
-| `LoopbackFileServer.java` | Loopback-only HTTP file server (assets + uploads), per-session token |
+| `AssetRequestHandler.java` | Same-origin JCEF asset interception; confined worker-streamed file reads |
 | `ServerManager.java` | Javalin lifecycle on 0.0.0.0:8765, LAN address scan/watch, log ring (200), port probe |
 | `SyncRooms.java` | In-process room state machine (one room per deck), canonical state JSON |
 | `PhoneWsHandler.java` | Phone WebSocket sessions: token-checked join, nav, heartbeat, broadcasts |
@@ -31,7 +31,7 @@ flowchart TD
     B -- no --> C["AppInstanceGuard.acquire() FileLock on ~/.chasse-studio/app.lock<br/>second instance -> message + exit"]
     C --> D["CefAppBuilder: install dir ~/.chasse-studio/jcef-bundle<br/>cache_path ~/.chasse-studio/browser-profile (NEW 1.3.0)<br/>root_cache_path ~/.chasse-studio"]
     D --> E["CefClient, first-run URL prompt if app.url blank"]
-    E --> F["FsService + LoopbackFileServer on 127.0.0.1:random-port<br/>(48-hex per-session token)"]
+    E --> F["FsService + AssetRequestHandler<br/>(same-origin virtual paths; no file listener)"]
     F --> G["DesktopBridge (CefMessageRouter on window.cefQuery)"]
     G --> G2["DownloadBridge (addDownloadHandler)<br/>WindowDialogs (addJSDialogHandler + addLifeSpanHandler)<br/>display handler onAddressChange -> bridge.setCurrentUrl"]
     G2 --> I["browser loads app.url<br/>Swing window: custom title bar, menus, Ctrl+F11,<br/>phone fullscreen -> RemoteControlListener -> EDT"]
@@ -53,8 +53,8 @@ Notes verified in `Main.java`:
   instance → "already running" dialog + exit 0.
 - **Shutdown**: `servers.stop()` → `browser.close(true)` → `cefApp.dispose()`,
   with a daemon 3s `halt(0)` guard so the app exits even if CEF hangs.
-- The loopback file server failing to start is logged but not fatal; `fs.fileUrl`
-  then answers `IO_ERROR: file server is not running`.
+- The asset handler is attached directly to `CefClient`; its reads are
+  independent of the phone remote server's start/stop state.
 
 ## THE BRIDGE CONTRACT
 
@@ -102,7 +102,8 @@ failure.
 | `fs.duplicateDeck` | `{deck, copyId, title?}` | `{ok:true, id}` — copy + patched `deck.json` (id/title/modified), deck.json last |
 | `fs.listFiles` | `{deck, dir?}` | `[{name,directory,size,modified}]` — one level |
 | `fs.delete` | `{deck, path}` | `{ok:true}` — file or folder, verified gone |
-| `fs.fileUrl` | `{deck, path}` | `{url}` — loopback URL `http://127.0.0.1:<port>/<token>/<deck>/<path>` |
+| `assetUrls` hello capability | — | Enables `/__chasse_files__/<deck>/<path>` interception |
+| `fs.beginAssetUpload` / `fs.writeAssetChunk` / `fs.finishAssetUpload` | upload path + bounded chunks | streamed temp file + atomic rename |
 
 **Error codes** (v2 failures, HTTP layer uses the same codes):
 `FOLDER_NOT_SET`, `FOLDER_MISSING`, `NO_OS_PERMISSION`, `NOT_FOUND`,
@@ -146,7 +147,7 @@ flowchart LR
     T2 -- yes --> ANS["answer anyone"]
     T2 -- no --> TR{"isTrusted?"}
     TR -- no --> FBD["error: code=FORBIDDEN"]
-    TR -- yes --> W["fs-worker: dispatchFs -> FsService / LoopbackFileServer"]
+    TR -- yes --> W["fs-worker: dispatchFs -> FsService"]
     R -- "v1" --> T1{"getBridgeInfo?"}
     T1 -- yes --> INFO["answer anyone"]
     T1 -- no --> TR2{"isTrusted?"}
@@ -254,35 +255,15 @@ permissions do.
 - The root is re-checked (`isDirectory`/readable/writable) before **every**
   operation → `FOLDER_NOT_SET` / `FOLDER_MISSING` / `NO_OS_PERMISSION`.
 
-## LoopbackFileServer — security core
+## AssetRequestHandler — security core
 
-Serves deck files (GET/HEAD) and accepts uploads (PUT) on a **random port bound
-to `127.0.0.1` only** — physically unreachable from the LAN; it shares nothing
-with the 0.0.0.0:8765 phone server. URL shape
-`http://127.0.0.1:<port>/<session-token>/<deck>/<path...>` (every segment
-percent-encoded).
-
-Defense in depth per request:
-
-1. **Host** must be exactly `127.0.0.1:<port>` or `localhost:<port>` (DNS
-   rebinding stop) → else 403.
-2. **Origin**, when present, must equal the trusted app origin → else 403.
-   (Image/CSS subresource loads send no Origin and rely on the token.)
-3. **Token** (48 hex, `SecureRandom`, per session) compared constant-time via
-   `MessageDigest.isEqual`; a wrong token returns **404 indistinguishable from
-   "nothing here"**.
-4. Every path is **re-confined** by `FsService` on the Java side (deck must
-   exist, symlinked write targets refused).
-5. **Size limits enforced while streaming**: PUT is capped at 256 MiB with a
-   `Content-Length` precheck (413) and the same cap during the stream; uploads
-   land via temp file + fsync + atomic rename.
-
-Caching: `ETag: W/"<size>-<mtime>"`, `If-None-Match` → 304, single-range
-`Range` support (206/416), `Cache-Control: private, max-age=60`. `OPTIONS`
-preflight echoes the trusted origin (methods GET/HEAD/PUT/OPTIONS, requested
-headers) and answers Chromium's Private Network Access check
-(`Access-Control-Allow-Private-Network: true`) — needed because the public
-HTTPS page fetches loopback.
+JCEF intercepts `/__chasse_files__/` on the configured hosted origin and the
+explicit localhost:3000 dev origin before network loading. The request origin
+must match its initiating frame. Java resolves the deck id through the catalog,
+decodes URL segments, and applies the same lexical/canonical confinement rules
+as `FsService`. GET/HEAD responses stream on a worker pool, support byte ranges
+and validators, and log status/bytes/duration. Uploads use bounded bridge chunks
+and atomic temp-file rename. No file listener or port is opened.
 
 ## How the repos depend on each other
 
@@ -293,8 +274,8 @@ flowchart LR
     end
     subgraph DESKTOP["chasse-desktop (this repo)"]
         JCEF["JCEF webview loads app.url"]
-        BR["DesktopBridge 1.3.0<br/>capabilities: sync, fs, downloads"]
-        FS["FsService + LoopbackFileServer (decks folder)"]
+        BR["DesktopBridge 1.4.0<br/>capabilities: sync, fs, downloads, assetUrls"]
+        FS["FsService + AssetRequestHandler (decks folder)"]
         SYNC["Javalin :8765 + SyncRooms + phones"]
     end
     JCEF -- "loads the deployed URL" --> WA
@@ -307,7 +288,7 @@ flowchart LR
 - The bridge contract above is the **only** coupling between the repos — both
   sides must keep it identical (the web repo's contract test mocks the Java
   side).
-- Capability/version discovery: `hello` → `{app:"chasse-desktop", version:"1.3.0",
-  capabilities:["sync","fs","downloads"]}`. An installed build without `"fs"`
+- Capability/version discovery: `hello` → `{app:"chasse-desktop", version:"1.4.0",
+  capabilities:["sync","fs","downloads","assetUrls"]}`. An installed build without `"fs"`
   makes the web app fall back to browser storage (and the web app shows a
   "Desktop app update available" notice in that case).

@@ -99,6 +99,29 @@ class FsServiceTest {
     }
 
     @Test
+    void chunkUploadAtomicallyPublishesAssetAndReadFallbackIsBounded() throws Exception {
+        fs.createDeck("demo", deckFiles("Demo"));
+        String uploadId = fs.beginAssetUpload("demo", "assets/space image.png");
+        fs.writeAssetChunk(uploadId, java.util.Base64.getEncoder().encodeToString(new byte[]{1, 2, 3}));
+        assertFalse(Files.exists(tempDir.resolve("decks/demo/assets/space image.png")));
+        JsonObject result = fs.finishAssetUpload(uploadId);
+        assertEquals(3, result.get("size").getAsInt());
+        assertArrayEquals(new byte[]{1, 2, 3}, Files.readAllBytes(tempDir.resolve("decks/demo/assets/space image.png")));
+        assertEquals(java.util.Base64.getEncoder().encodeToString(new byte[]{1, 2, 3}),
+                fs.readAssetBase64("demo", "assets/space image.png"));
+    }
+
+    @Test
+    void abortedChunkUploadLeavesNoDestinationOrTempFile() throws Exception {
+        fs.createDeck("demo", deckFiles("Demo"));
+        String uploadId = fs.beginAssetUpload("demo", "assets/aborted.png");
+        fs.writeAssetChunk(uploadId, java.util.Base64.getEncoder().encodeToString(new byte[]{1, 2, 3}));
+        fs.abortAssetUpload(uploadId);
+        assertFalse(Files.exists(tempDir.resolve("decks/demo/assets/aborted.png")));
+        assertEquals(0, fs.listFiles("demo", "assets").size());
+    }
+
+    @Test
     void rejectsIllegalPaths() {
         assertThrows(FsService.FsException.class, () -> FsService.checkRelPath(""));
         assertThrows(FsService.FsException.class, () -> FsService.checkRelPath("/absolute"));
