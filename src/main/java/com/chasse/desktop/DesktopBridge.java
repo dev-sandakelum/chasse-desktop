@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import javax.swing.SwingUtilities;
 
 /**
  * The JCEF JavaScript bridge (Transport A of the Desktop Bridge Protocol).
@@ -47,7 +48,7 @@ import java.util.concurrent.Executors;
  */
 public final class DesktopBridge {
 
-    public static final String VERSION = "1.4.0";
+    public static final String VERSION = "1.5.0";
 
     private final AppConfig config;
     private final ServerManager servers;
@@ -72,6 +73,8 @@ public final class DesktopBridge {
     private volatile String currentUrl = "";
     /** native download support (set by Main) — serves the openDownloadFolder action */
     private volatile DownloadBridge downloads;
+    /** window fullscreen toggle (set by Main) — serves the toggleFullscreen action */
+    private volatile Runnable fullscreenToggle;
 
     public DesktopBridge(org.cef.CefClient client, AppConfig config, ServerManager servers, SyncRooms rooms) {
         this(client, config, servers, rooms, null);
@@ -105,6 +108,12 @@ public final class DesktopBridge {
     /** The native download support (for the openDownloadFolder action). */
     public void setDownloads(DownloadBridge downloads) {
         this.downloads = downloads;
+    }
+
+    /** The window's fullscreen toggle (for the toggleFullscreen action — the
+     *  embedded webview cannot use the browser Fullscreen API). */
+    public void setFullscreenToggle(Runnable toggle) {
+        this.fullscreenToggle = toggle;
     }
 
     /* ------------------------------------------------------------------ */
@@ -325,6 +334,17 @@ public final class DesktopBridge {
                 JsonObject data = new JsonObject();
                 data.addProperty("ok", opened);
                 respondOk(callback, id, data);
+            }
+            case "toggleFullscreen" -> {
+                // Present mode's fullscreen button inside the webview — the
+                // Fullscreen API is unavailable in JCEF, so the WINDOW does it
+                Runnable toggle = fullscreenToggle;
+                if (toggle == null) {
+                    respondError(callback, id, "fullscreen is not available in this build");
+                    return;
+                }
+                SwingUtilities.invokeLater(toggle);
+                respondOkSimple(callback, id);
             }
             default -> respondError(callback, id, "unknown action");
         }

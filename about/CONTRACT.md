@@ -1,6 +1,6 @@
 # Chassé Studio — Web ↔ Java Bridge Contract
 
-Version **1.4.0** · Java-side bridge contract. The web integration copy lives
+Version **1.5.0** · Java-side bridge contract. The web integration copy lives
 at `presentation-2/about/CONTRACT.md`.
 
 ---
@@ -45,6 +45,7 @@ not match `app.url`.
 | `setNotes` | `{deckId, slideId, note}` | `{ok: true}` | Note capped at 8000 chars; U+2028/U+2029 stripped |
 | `setUi` | `{deckId, qr?, overview?}` | `{ok: true}` | Relayed to the room's phones as `{"type":"ui"}` |
 | `ping` | — | `{t}` | `t`: server timestamp ms |
+| `toggleFullscreen` | — | `{ok: true}` | Toggles the app window's fullscreen (the webview cannot use the browser Fullscreen API; used by Present mode) |
 | `openDownloadFolder` | — | `{ok: boolean}` | Reveals the folder of the last completed download; **takes no path** |
 
 `slides` in `joinRoom`/`syncDeck` shape: `[{id: string, label: string}]` (MAX 500).
@@ -86,7 +87,7 @@ and return `{code: "FORBIDDEN", message: "…"}` otherwise.
 
 | Command | Params | Success shape | Notes |
 |---|---|---|---|
-| `hello` | — | `{app: "chasse-desktop", version: "1.4.0", capabilities: ["sync","fs","downloads","assetUrls"]}` | Available to untrusted pages |
+| `hello` | — | `{app: "chasse-desktop", version: "1.5.0", capabilities: ["sync","fs","downloads","assetUrls"]}` | Available to untrusted pages |
 | `fs.getRoot` | — | `{configured: bool, path: string, valid: bool}` | Never throws; it is the health report |
 | `fs.chooseRoot` | `{title?, startPath?, hint?}` | `{cancelled: true}` OR `{configured, path, valid}` | Cancel is a clean answer, not an error; shows native folder chooser on Swing EDT |
 | `fs.listDecks` | — | `[{id, title, folder, slides, modified}]` | Sorted by modified descending |
@@ -283,7 +284,7 @@ attempts) and immediately on `visibilitychange`.
 
 ## Versioning
 
-- Bridge protocol version `1.4.0` is advertised by `hello.version` and
+- Bridge protocol version `1.5.0` is advertised by `hello.version` and
   `getBridgeInfo.version`.
 - The web app must handle older builds gracefully (see Compatibility section
   above).

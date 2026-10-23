@@ -274,7 +274,7 @@ flowchart LR
     end
     subgraph DESKTOP["chasse-desktop (this repo)"]
         JCEF["JCEF webview loads app.url"]
-        BR["DesktopBridge 1.4.0<br/>capabilities: sync, fs, downloads, assetUrls"]
+        BR["DesktopBridge 1.5.0<br/>capabilities: sync, fs, downloads, assetUrls"]
         FS["FsService + AssetRequestHandler (decks folder)"]
         SYNC["Javalin :8765 + SyncRooms + phones"]
     end

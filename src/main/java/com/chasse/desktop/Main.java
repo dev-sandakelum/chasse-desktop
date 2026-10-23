@@ -230,6 +230,10 @@ public final class Main {
             client.addJSDialogHandler(WindowDialogs.jsDialogs(
                     () -> frameRef.get() == null ? null : frameRef.get()));
             client.addLifeSpanHandler(WindowDialogs.popupsToSystemBrowser(servers));
+            // native file choosers for <input type=file> (Import / Load .smdeck) —
+            // the default JCEF dialog handling is unreliable in some builds
+            client.addDialogHandler(FileDialogs.fileDialogs(
+                    () -> frameRef.get() == null ? null : frameRef.get()));
 
             client.addDisplayHandler(new CefDisplayHandlerAdapter() {
                 @Override public void onAddressChange(CefBrowser b, CefFrame f, String url) {
@@ -277,6 +281,10 @@ public final class Main {
 
                 // Ctrl+F11 fullscreen (webview swallows plain F11)
                 registerF11Toggle(frame, titleBar);
+
+                // the webview's Present-mode fullscreen button drives the SAME
+                // window toggle through the bridge (toggleFullscreen)
+                bridge.setFullscreenToggle(() -> toggleFullscreen(frame, titleBar));
 
                 // phone-remote → window fullscreen
                 servers.addRemoteControlListener((deckId, action) ->

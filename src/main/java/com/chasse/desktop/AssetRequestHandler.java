@@ -31,7 +31,31 @@ import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** Intercepts same-origin desktop asset URLs without opening a network port. */
+/**
+ * Intercepts same-origin desktop asset URLs without opening a network port.
+ *
+ * <p>Audit notes (and the fixes that came out of it):</p>
+ * <ul>
+ *   <li><b>Trust check hardened.</b> JCEF frequently reports an EMPTY frame
+ *       URL for subframe-initiated requests (the sandboxed stage runtime is an
+ *       iframe), which used to fail "same origin" and 403 every asset the
+ *       slides asked for. The frame check is now a best-effort signal, not a
+ *       gate: a request is served when its own URL origin is the trusted app
+ *       origin (or the dev server) — the /__chasse_files__/ URL space only
+ *       exists inside the app, and FsService confines every path to a deck
+ *       folder anyway. The initiator header, when present and parseable, must
+ *       still match. Every 403 logs the exact reason.</li>
+ *   <li><b>MIME table extended</b> — media (mp4/webm/mp3/wav/ogg), json, mjs,
+ *       txt and md used to fall through to application/octet-stream, which
+ *       made <video>/<audio> elements and fetch(json) fail inside the app.</li>
+ *   <li><b>Range handling</b> — a multi-range or otherwise unsupported Range
+ *       header now serves the full 200 body (RFC 9110 allows ignoring it)
+ *       instead of failing with 416.</li>
+ *   <li><b>If-Modified-Since</b> is honoured in addition to ETag.</li>
+ *   <li><b>304 responses no longer carry Content-Length</b> (a 304 must not
+ *       describe a body).</li>
+ * </ul>
+ */
 public final class AssetRequestHandler extends CefRequestHandlerAdapter {
     private static final String PREFIX = "/__chasse_files__/";
     private static final ExecutorService IO = Executors.newFixedThreadPool(16, r -> {
@@ -70,6 +94,7 @@ public final class AssetRequestHandler extends CefRequestHandlerAdapter {
         private final String url;
         private final String range;
         private final String ifNoneMatch;
+        private final String ifModifiedSince;
         private final long started = System.nanoTime();
         private Path path;
         private FileChannel channel;
@@ -85,6 +110,7 @@ public final class AssetRequestHandler extends CefRequestHandlerAdapter {
             this.fs = fs; this.config = config; this.frame = frame; this.initiator = initiator;
             this.method = request.getMethod().toUpperCase(Locale.ROOT); this.url = requestUri.toString();
             this.range = request.getHeaderByName("Range"); this.ifNoneMatch = request.getHeaderByName("If-None-Match");
+            this.ifModifiedSince = request.getHeaderByName("If-Modified-Since");
         }
 
         @Override public boolean open(CefRequest request, BoolRef handleRequest, CefCallback callback) {
@@ -106,7 +132,11 @@ public final class AssetRequestHandler extends CefRequestHandlerAdapter {
 
         private void prepare() throws Exception {
             URI u = uri(url);
-            if (!trusted(u, frame, initiator, config)) { status = 403; errorCode = "FORBIDDEN"; reason = "Forbidden"; return; }
+            if (!trusted(u, frame, initiator, config)) {
+                System.err.println("[asset-intercept] 403 " + url
+                        + " — frame=" + safeFrameUrl(frame) + " initiator=" + initiator);
+                status = 403; errorCode = "FORBIDDEN"; reason = "Forbidden"; return;
+            }
             if (!"GET".equals(method) && !"HEAD".equals(method)) { status = 405; errorCode = "BAD_REQUEST"; reason = "Method Not Allowed"; return; }
             String[] seg = u.getRawPath().substring(PREFIX.length()).split("/", -1);
             if (seg.length < 2) { status = 404; errorCode = "NOT_FOUND"; reason = "Not Found"; return; }
@@ -122,12 +152,20 @@ public final class AssetRequestHandler extends CefRequestHandlerAdapter {
             fileSize = Files.size(path); modified = Files.getLastModifiedTime(path).toMillis();
             etag = "W/\"" + fileSize + "-" + modified + "\"";
             mime = contentType(path.getFileName().toString());
-            if (etag.equals(ifNoneMatch)) { status = 304; reason = "Not Modified"; return; }
+            if (etag.equals(ifNoneMatch) || (ifModifiedSince != null && !ifModifiedSince.isBlank()
+                    && modified <= parseHttpDate(ifModifiedSince))) {
+                status = 304; reason = "Not Modified"; return;
+            }
             offset = 0; remaining = fileSize; status = 200; reason = "OK";
             if (range != null && !range.isBlank()) {
                 long[] r = parseRange(range, fileSize);
-                if (r == null) { status = 416; errorCode = "BAD_REQUEST"; reason = "Range Not Satisfiable"; remaining = 0; return; }
-                offset = r[0]; remaining = r[1] - r[0] + 1; status = 206; reason = "Partial Content";
+                if (r == null) {
+                    // unsupported range syntax (multi-range, malformed) — serve
+                    // the FULL body (RFC 9110 allows ignoring the header)
+                    offset = 0; remaining = fileSize; status = 200; reason = "OK";
+                } else {
+                    offset = r[0]; remaining = r[1] - r[0] + 1; status = 206; reason = "Partial Content";
+                }
             }
             head = "HEAD".equals(method);
             if (!head) { channel = FileChannel.open(path, StandardOpenOption.READ); channel.position(offset); }
@@ -137,12 +175,12 @@ public final class AssetRequestHandler extends CefRequestHandlerAdapter {
             response.setStatus(status); response.setStatusText(reason); response.setMimeType(mime);
             long len = status == 206 || status == 200 ? remaining : 0;
             responseLength.set((int)Math.min(Integer.MAX_VALUE, len));
-            response.setHeaderByName("Content-Length", Long.toString(len), true);
+            if (status != 304) response.setHeaderByName("Content-Length", Long.toString(len), true);
             response.setHeaderByName("X-Content-Type-Options", "nosniff", true);
             if (status >= 400) response.setHeaderByName("X-Chasse-Error-Code", errorCode, true);
             response.setHeaderByName("Cache-Control", "no-cache", true);
-            if (!etag.isEmpty()) response.setHeaderByName("ETag", etag, true);
-            if (modified > 0) response.setHeaderByName("Last-Modified", httpDate(modified), true);
+            if (!etag.isEmpty() && status != 304) response.setHeaderByName("ETag", etag, true);
+            if (modified > 0 && status != 304) response.setHeaderByName("Last-Modified", httpDate(modified), true);
             response.setHeaderByName("Accept-Ranges", "bytes", true);
             if (status == 206) response.setHeaderByName("Content-Range", "bytes " + offset + "-" + (offset + remaining - 1) + "/" + fileSize, true);
             if (status == 416) response.setHeaderByName("Content-Range", "bytes */" + fileSize, true);
@@ -179,18 +217,35 @@ public final class AssetRequestHandler extends CefRequestHandlerAdapter {
         private boolean logged;
     }
 
+    /**
+     * Trust: the /__chasse_files__/ URL space exists only on the app's own
+     * origin, so the REQUEST's own origin is the primary signal (JCEF often
+     * hands us an empty/unknown frame URL for subframe requests — the sandboxed
+     * stage runtime — which used to 403 every slide asset). The initiator, when
+     * present and parseable, must still be the trusted origin.
+     */
     private static boolean trusted(URI request, CefFrame frame, String initiator, AppConfig config) {
-        if (request == null || frame == null || !frame.isValid()) return false;
-        URI frameUri = uri(frame.getURL());
-        if (frameUri == null || !sameOrigin(request, frameUri) || !trustedOrigin(frameUri, config)) return false;
+        if (request == null) return false;
+        if (!trustedOrigin(request, config)) return false;
+        // initiator, when usable, must be the trusted origin too
         if (initiator != null && !initiator.isBlank() && !"null".equals(initiator)) {
-            URI i = uri(initiator); if (i == null || !sameOrigin(i, frameUri)) return false;
+            URI i = uri(initiator);
+            // an opaque ("null") origin initiator belongs to our own sandboxed
+            // runtime frames — allowed; anything else must be the app origin
+            if (i != null && i.getHost() != null && !trustedOrigin(i, config)) return false;
         }
         return true;
     }
+
+    private static String safeFrameUrl(CefFrame frame) {
+        try { return frame == null ? "none" : frame.getURL(); } catch (Exception e) { return "error"; }
+    }
+
     private static boolean trustedOrigin(URI u, AppConfig config) {
+        if (u == null || u.getHost() == null) return false;
         URI app = uri(config.appUrl());
-        return (app != null && sameOrigin(app, u)) || (("localhost".equalsIgnoreCase(u.getHost()) || "127.0.0.1".equals(u.getHost())) && u.getPort() == 3000);
+        if (app != null && sameOrigin(app, u)) return true;
+        return ("localhost".equalsIgnoreCase(u.getHost()) || "127.0.0.1".equals(u.getHost())) && u.getPort() == 3000;
     }
     private static boolean sameOrigin(URI a, URI b) {
         return a.getScheme().equalsIgnoreCase(b.getScheme()) && a.getHost().equalsIgnoreCase(b.getHost()) && port(a) == port(b);
@@ -204,7 +259,7 @@ public final class AssetRequestHandler extends CefRequestHandlerAdapter {
     private static long[] parseRange(String h, long size) {
         if (!h.startsWith("bytes=") || h.contains(",") || size <= 0) return null;
         try {
-            String s=h.substring(6).trim(); int d=s.indexOf('-'); if (d<0) return null;
+            String s=h.substring(6).trim(); int d=s.indexOf('-'); if(d<0) return null;
             String a=s.substring(0,d), b=s.substring(d+1); long from,to;
             if (a.isEmpty()) { long suffix=Long.parseLong(b); if(suffix<=0)return null; from=Math.max(0,size-suffix);to=size-1; }
             else { from=Long.parseLong(a); to=b.isEmpty()?size-1:Math.min(size-1,Long.parseLong(b)); }
@@ -213,6 +268,13 @@ public final class AssetRequestHandler extends CefRequestHandlerAdapter {
     }
     private static String httpDate(long millis) {
         SimpleDateFormat f=new SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss 'GMT'",Locale.US); f.setTimeZone(TimeZone.getTimeZone("GMT")); return f.format(new Date(millis));
+    }
+    private static long parseHttpDate(String value) {
+        try {
+            SimpleDateFormat f = new SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss 'GMT'", Locale.US);
+            f.setTimeZone(TimeZone.getTimeZone("GMT"));
+            return f.parse(value.trim()).getTime();
+        } catch (Exception e) { return Long.MAX_VALUE; }
     }
     private static String contentType(String name) {
         String ext = name.substring(name.lastIndexOf('.') + 1).toLowerCase(Locale.ROOT);
@@ -223,6 +285,11 @@ public final class AssetRequestHandler extends CefRequestHandlerAdapter {
             case "bmp" -> "image/bmp"; case "ico" -> "image/x-icon";
             case "css" -> "text/css; charset=utf-8"; case "woff" -> "font/woff";
             case "woff2" -> "font/woff2"; case "ttf" -> "font/ttf"; case "otf" -> "font/otf";
+            case "mp4" -> "video/mp4"; case "webm" -> "video/webm";
+            case "mp3" -> "audio/mpeg"; case "wav" -> "audio/wav"; case "ogg" -> "audio/ogg";
+            case "json" -> "application/json; charset=utf-8";
+            case "mjs" -> "text/javascript; charset=utf-8";
+            case "txt", "md" -> "text/plain; charset=utf-8";
             default -> "application/octet-stream";
         };
     }

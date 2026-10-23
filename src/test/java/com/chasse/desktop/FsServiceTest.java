@@ -32,18 +32,26 @@ class FsServiceTest {
 
     private FsService fs;
 
-    // A minimal deck.json payload that the service accepts.
-    private static JsonObject deckFiles(String title) {
+    // A minimal deck.json payload that the service accepts. The deck id MUST
+    // match the folder it is created in — the web side always writes it that
+    // way (desktop-store patches deck.json before fs.createDeck), and the
+    // library is keyed by the deck.json id, so two decks sharing one id would
+    // collapse into a single library entry.
+    private static JsonObject deckFiles(String id, String title) {
         JsonObject files = new JsonObject();
         JsonObject deck = new JsonObject();
         deck.addProperty("format", "smdeck");
         deck.addProperty("format_version", 1);
-        deck.addProperty("id", "demo");
+        deck.addProperty("id", id);
         deck.addProperty("title", title);
         deck.add("slides", new JsonArray());
         files.addProperty("deck.json", deck.toString());
         files.addProperty("theme.css", ":root { color: red; }");
         return files;
+    }
+
+    private static JsonObject deckFiles(String title) {
+        return deckFiles("demo", title);
     }
 
     private static String code(FsService.FsException e) {
@@ -206,6 +214,39 @@ class FsServiceTest {
     }
 
     @Test
+    void overwriteCreatesHistoryBackupAndKeepsWriting() throws Exception {
+        // regression: the very first overwrite of a file used to fail with
+        // "path not accessible: <snapshot dir>" because backupBeforeWrite()
+        // handed a not-yet-created .history/<ts-uuid> folder to
+        // resolveConfined(), which resolves its base with toRealPath().
+        fs.createDeck("hist", deckFiles("hist", "History"));
+        fs.writeText("hist", "slides/s.tsx", "// v1");
+        fs.writeText("hist", "slides/s.tsx", "// v2");   // first overwrite → backup
+        fs.writeText("hist", "slides/s.tsx", "// v3");   // second overwrite → another backup
+        assertEquals("// v3", fs.readText("hist", "slides/s.tsx").get("text").getAsString());
+        Path history = tempDir.resolve("decks/hist/.history");
+        assertTrue(Files.isDirectory(history), ".history exists after overwrites");
+        int backups = 0;
+        try (var s = Files.list(history)) {
+            for (Path snap : s.filter(Files::isDirectory).toList()) {
+                assertTrue(Files.isRegularFile(snap.resolve("slides/s.tsx")),
+                        "backup carries the pre-write content");
+                backups++;
+            }
+        }
+        assertTrue(backups >= 2, "each overwrite left a backup (found " + backups + ")");
+        // the CURRENT file is v3 — backups hold older content
+        boolean sawOldContent = false;
+        try (var s = Files.list(history)) {
+            for (Path snap : s.filter(Files::isDirectory).toList()) {
+                String content = Files.readString(snap.resolve("slides/s.tsx"));
+                if (content.equals("// v1") || content.equals("// v2")) sawOldContent = true;
+            }
+        }
+        assertTrue(sawOldContent, "a backup preserves the pre-write version");
+    }
+
+    @Test
     void writeTextRoundTripsWithNoTempFilesLeftBehind() throws Exception {
         fs.createDeck("w", deckFiles("W"));
         fs.writeText("w", "slides/a.tsx", "export default function Slide() {}");
@@ -314,8 +355,8 @@ class FsServiceTest {
 
     @Test
     void listDecksFindsOnlyRealDeckFolders() throws Exception {
-        fs.createDeck("alpha", deckFiles("Alpha"));
-        fs.createDeck("beta", deckFiles("Beta"));
+        fs.createDeck("alpha", deckFiles("alpha", "Alpha"));
+        fs.createDeck("beta", deckFiles("beta", "Beta"));
         Files.createDirectories(tempDir.resolve("decks/not-a-deck")); // no deck.json
         Files.createDirectories(tempDir.resolve("decks/UPPER"));      // invalid id
         JsonArray decks = fs.listDecks();

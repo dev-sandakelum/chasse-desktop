@@ -838,6 +838,11 @@ public final class FsService {
         if (!Files.isRegularFile(file)) return;
         Path history = deckDir.resolve(".history");
         Path snapshot = history.resolve(System.currentTimeMillis() + "-" + java.util.UUID.randomUUID());
+        // the snapshot dir must EXIST before resolveConfined() — it resolves the
+        // base with toRealPath(), which throws for a missing folder. Without
+        // this, EVERY save that overwrote an existing file failed with
+        // "path not accessible: <snapshot dir>" (caught by FsServiceTest).
+        Files.createDirectories(snapshot);
         Path copy = resolveConfined(snapshot, rel);
         Files.createDirectories(copy.getParent());
         copyFileAtomic(file, copy);
