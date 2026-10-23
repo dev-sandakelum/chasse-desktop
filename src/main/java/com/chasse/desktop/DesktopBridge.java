@@ -14,8 +14,7 @@ import org.cef.handler.CefMessageRouterHandlerAdapter;
 import java.net.URI;
 import java.util.List;
 import java.util.Locale;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import javax.swing.SwingUtilities;
 
 /**
@@ -55,19 +54,13 @@ public final class DesktopBridge {
     private final SyncRooms rooms;
     private final FsService fs;
     private final Gson gson = new Gson();
-    /** Worker for server lifecycle calls (start/stop/restart block). */
-    private final ExecutorService worker = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "bridge-worker");
-        t.setDaemon(true);
-        return t;
-    });
-    /** Worker for fs commands — file IO must never block the CEF UI thread,
-     *  and fs.chooseRoot shows a native dialog for as long as the user wants. */
-    private final ExecutorService fsWorker = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "fs-worker");
-        t.setDaemon(true);
-        return t;
-    });
+    // All worker threads live in the shared WorkerPools infrastructure:
+    // named daemon threads, bounded queues, clean JVM shutdown. The old
+    // unbounded cached pools could grow one thread per queued chunk upload.
+    // Server lifecycle (start/stop/restart block on Javalin) runs on the
+    // bridge pool; fs commands run on the dedicated fs pool (file IO +
+    // native dialogs must never block the CEF UI thread, and several fs
+    // requests from the page must be able to run at the same time).
 
     private volatile CefBrowser browser;
     private volatile String currentUrl = "";
@@ -189,13 +182,30 @@ public final class DesktopBridge {
             if (idEl != null && !idEl.isJsonNull()) {
                 id = idEl;
             }
+            final JsonElement requestId = id;
             String action = optString(req, "action");
             JsonObject payload = new JsonObject();
             JsonElement payloadEl = req.get("payload");
             if (payloadEl != null && payloadEl.isJsonObject()) {
                 payload = payloadEl.getAsJsonObject();
             }
-            dispatch(action, payload, id, callback);
+            final JsonObject body = payload;
+            final String act = action;
+            // v1 actions run OFF the CEF UI thread: several of them touch
+            // synchronized server state or fire room broadcasts, and none of
+            // that may stall the UI thread. The callback is answered from the
+            // worker exactly like the fs commands already do.
+            try {
+                WorkerPools.bridgeExecute(() -> {
+                    try {
+                        dispatch(act, body, requestId, callback);
+                    } catch (Exception e) {
+                        respondError(callback, requestId, "internal error");
+                    }
+                });
+            } catch (RejectedExecutionException saturated) {
+                respondError(callback, requestId, "busy — too many pending actions");
+            }
         } catch (Exception e) {
             respondError(callback, id, "bad request");
         }
@@ -225,17 +235,30 @@ public final class DesktopBridge {
             case "getServerLog" -> respondOk(callback, id, servers.logSnapshot());
             case "startServer" -> {
                 System.out.println("[bridge] startServer received from page");
-                worker.execute(servers::start);
+                try {
+                    WorkerPools.bridgeExecute(servers::start);
+                } catch (RejectedExecutionException saturated) {
+                    // server start is idempotent — a dropped request under
+                    // saturation is retried by the page's next status poll
+                }
                 respondOkSimple(callback, id);
             }
             case "stopServer" -> {
                 System.out.println("[bridge] stopServer received from page");
-                worker.execute(servers::stop);
+                try {
+                    WorkerPools.bridgeExecute(servers::stop);
+                } catch (RejectedExecutionException saturated) {
+                    // same idempotence argument as startServer
+                }
                 respondOkSimple(callback, id);
             }
             case "restartServer" -> {
                 System.out.println("[bridge] restartServer received from page");
-                worker.execute(servers::restart);
+                try {
+                    WorkerPools.bridgeExecute(servers::restart);
+                } catch (RejectedExecutionException saturated) {
+                    // same idempotence argument as startServer
+                }
                 respondOkSimple(callback, id);
             }
             case "selectAddress" -> {
@@ -385,17 +408,24 @@ public final class DesktopBridge {
                         "this page is not allowed to use desktop file commands");
                 return;
             }
-            fsWorker.execute(() -> {
-                try {
-                    JsonElement data = dispatchFs(cmd, req);
-                    callback.success(data == null ? "{}" : gson.toJson(data));
-                } catch (FsService.FsException e) {
-                    respondCmdError(callback, e.code, e.getMessage());
-                } catch (Exception e) {
-                    respondCmdError(callback, FsService.CODE_IO_ERROR,
-                            "fs command failed: " + (e.getMessage() == null ? e.toString() : e.getMessage()));
-                }
-            });
+            try {
+                WorkerPools.fsExecute(() -> {
+                    try {
+                        JsonElement data = dispatchFs(cmd, req);
+                        callback.success(data == null ? "{}" : gson.toJson(data));
+                    } catch (FsService.FsException e) {
+                        respondCmdError(callback, e.code, e.getMessage());
+                    } catch (Exception e) {
+                        respondCmdError(callback, FsService.CODE_IO_ERROR,
+                                "fs command failed: " + (e.getMessage() == null ? e.toString() : e.getMessage()));
+                    }
+                });
+            } catch (RejectedExecutionException saturated) {
+                // bounded back-pressure: answer BUSY instead of growing threads
+                // or blocking the CEF UI thread; the web app surfaces it like
+                // any other fs error and the user can retry
+                respondCmdError(callback, "BUSY", "the file bridge is busy — please retry");
+            }
             return;
         }
         respondCmdError(callback, FsService.CODE_UNKNOWN_CMD, "unknown command: " + cmd);

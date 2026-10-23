@@ -28,8 +28,8 @@ import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
 import java.util.TimeZone;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Intercepts same-origin desktop asset URLs without opening a network port.
@@ -47,7 +47,7 @@ import java.util.concurrent.Executors;
  *       still match. Every 403 logs the exact reason.</li>
  *   <li><b>MIME table extended</b> — media (mp4/webm/mp3/wav/ogg), json, mjs,
  *       txt and md used to fall through to application/octet-stream, which
- *       made <video>/<audio> elements and fetch(json) fail inside the app.</li>
+ *       made &lt;video&gt;/&lt;audio&gt; elements and fetch(json) fail inside the app.</li>
  *   <li><b>Range handling</b> — a multi-range or otherwise unsupported Range
  *       header now serves the full 200 body (RFC 9110 allows ignoring it)
  *       instead of failing with 416.</li>
@@ -55,12 +55,29 @@ import java.util.concurrent.Executors;
  *   <li><b>304 responses no longer carry Content-Length</b> (a 304 must not
  *       describe a body).</li>
  * </ul>
+ *
+ * <p><b>Streaming model (parallel loading):</b> every {@code open()} and every
+ * {@code read()} chunk runs as a task on the shared bounded priority pool
+ * ({@link WorkerPools#assetSubmit}) — the CEF UI thread never blocks and many
+ * requests stream at the same time. Priorities:</p>
+ * <ul>
+ *   <li>The web app can mark an asset URL as user-critical with the query
+ *       {@code ?ss_p=hi} (the Present start slide and its neighbours do this):
+ *       those prepares and reads jump ahead of background work.</li>
+ *   <li>Continuation reads of an ALREADY-OPENED stream outrank new prepares,
+ *       so started streams finish and release their file handles instead of
+ *       starving behind an endless queue of new opens.</li>
+ * </ul>
+ * <p>Cross-thread state written by {@code prepare()} on a pool thread and read
+ * by {@code getResponseHeaders()}/{@code read()} on the CEF thread is passed
+ * through an immutable {@link Prepared} snapshot (the old code relied on the
+ * JNI Continue() boundary, which is not a Java Memory Model happens-before
+ * edge). Each request owns an independent cancel flag: {@code cancel()} flips
+ * it and closes the channel; queued tasks for that request see the flag and
+ * skip their work instead of touching a dead handler.</p>
  */
 public final class AssetRequestHandler extends CefRequestHandlerAdapter {
     private static final String PREFIX = "/__chasse_files__/";
-    private static final ExecutorService IO = Executors.newFixedThreadPool(16, r -> {
-        Thread t = new Thread(r, "desktop-asset-io"); t.setDaemon(true); return t;
-    });
     private final FsService fs;
     private final AppConfig config;
 
@@ -85,6 +102,33 @@ public final class AssetRequestHandler extends CefRequestHandlerAdapter {
         }
     }
 
+    /** Immutable response state — published once by prepare(), read everywhere. */
+    private static final class Prepared {
+        static final Prepared INTERNAL_ERROR = new Prepared(500, "Internal Server Error", "IO_ERROR",
+                "application/octet-stream", 0, 0, 0, 0, "", false, null);
+        static final Prepared BUSY = new Prepared(503, "Service Unavailable", "BUSY",
+                "application/octet-stream", 0, 0, 0, 0, "", false, null);
+        static final Prepared CANCELLED = new Prepared(499, "Client Closed Request", "CANCELLED",
+                "application/octet-stream", 0, 0, 0, 0, "", false, null);
+
+        final int status;
+        final String reason;
+        final String errorCode;
+        final String mime;
+        final long fileSize, modified, offset, remaining;
+        final String etag;
+        final boolean head;
+        final FileChannel channel; // null unless a body will be streamed
+
+        Prepared(int status, String reason, String errorCode, String mime,
+                 long fileSize, long modified, long offset, long remaining,
+                 String etag, boolean head, FileChannel channel) {
+            this.status = status; this.reason = reason; this.errorCode = errorCode; this.mime = mime;
+            this.fileSize = fileSize; this.modified = modified; this.offset = offset;
+            this.remaining = remaining; this.etag = etag; this.head = head; this.channel = channel;
+        }
+    }
+
     private static final class AssetResourceHandler extends CefResourceHandlerAdapter {
         private final FsService fs;
         private final AppConfig config;
@@ -95,38 +139,63 @@ public final class AssetRequestHandler extends CefRequestHandlerAdapter {
         private final String range;
         private final String ifNoneMatch;
         private final String ifModifiedSince;
+        private final boolean critical;      // ?ss_p=hi — user-visible asset
         private final long started = System.nanoTime();
-        private Path path;
-        private FileChannel channel;
-        private int status = 500;
-        private String reason = "Internal Server Error";
-        private String errorCode = "IO_ERROR";
-        private String mime = "application/octet-stream";
-        private long fileSize, modified, offset, remaining, bytesSent;
-        private String etag = "";
-        private boolean head;
+
+        /** Per-request cancel signal — never shared with another request. */
+        private final AtomicBoolean cancelled = new AtomicBoolean(false);
+        /** Response snapshot — volatile so the CEF thread sees prepare()'s writes. */
+        private volatile Prepared prepared = Prepared.INTERNAL_ERROR;
+        /** Bytes still to send (mutated by pool threads between CEF reads). */
+        private final AtomicLong remaining = new AtomicLong(0);
+        private volatile boolean logged = false;
 
         AssetResourceHandler(FsService fs, AppConfig config, CefFrame frame, String initiator, CefRequest request, URI requestUri) {
             this.fs = fs; this.config = config; this.frame = frame; this.initiator = initiator;
             this.method = request.getMethod().toUpperCase(Locale.ROOT); this.url = requestUri.toString();
             this.range = request.getHeaderByName("Range"); this.ifNoneMatch = request.getHeaderByName("If-None-Match");
             this.ifModifiedSince = request.getHeaderByName("If-Modified-Since");
+            this.critical = isCritical(requestUri.getRawQuery());
+        }
+
+        /** The web app marks Present-critical assets with ?ss_p=hi. */
+        private static boolean isCritical(String rawQuery) {
+            if (rawQuery == null) return false;
+            for (String pair : rawQuery.split("&")) {
+                if ("ss_p=hi".equals(pair)) return true;
+            }
+            return false;
         }
 
         @Override public boolean open(CefRequest request, BoolRef handleRequest, CefCallback callback) {
             handleRequest.set(false);
-            IO.execute(() -> {
-                try { prepare(); }
-                catch (Exception e) {
-                    String code = e instanceof FsService.FsException fe ? fe.code : "";
-                    errorCode = code.isBlank() ? "IO_ERROR" : code;
-                    status = FsService.CODE_NOT_FOUND.equals(code) ? 404
-                            : (FsService.CODE_FORBIDDEN.equals(code) || FsService.CODE_BAD_REQUEST.equals(code) || FsService.CODE_NO_OS_PERMISSION.equals(code)) ? 403 : 500;
-                    reason = status == 403 ? "Forbidden" : status == 404 ? "Not Found" : "Internal Server Error";
-                    System.err.println("[asset-intercept] " + url + " status=" + status + " reason=" + e.getMessage());
-                }
-                callback.Continue();
-            });
+            boolean accepted = WorkerPools.assetSubmit(
+                    critical ? WorkerPools.P_PREPARE_CRITICAL : WorkerPools.P_PREPARE,
+                    cancelled::get,
+                    () -> {
+                        try {
+                            prepare();
+                        } catch (Exception e) {
+                            String code = e instanceof FsService.FsException fe ? fe.code : "";
+                            String errorCode = code.isBlank() ? "IO_ERROR" : code;
+                            int status = FsService.CODE_NOT_FOUND.equals(code) ? 404
+                                    : (FsService.CODE_FORBIDDEN.equals(code) || FsService.CODE_BAD_REQUEST.equals(code) || FsService.CODE_NO_OS_PERMISSION.equals(code)) ? 403 : 500;
+                            String reason = status == 403 ? "Forbidden" : status == 404 ? "Not Found" : "Internal Server Error";
+                            prepared = new Prepared(status, reason, errorCode, "application/octet-stream",
+                                    0, 0, 0, 0, "", false, null);
+                            System.err.println("[asset-intercept] " + url + " status=" + status + " reason=" + e.getMessage());
+                        }
+                        if (!cancelled.get()) {
+                            callback.Continue();
+                        }
+                    });
+            if (!accepted) {
+                // bounded pool saturated — fail THIS request fast instead of
+                // blocking or unbounding the app; CEF retries image loads on
+                // its own and the page heals via the runtime's retry logic
+                prepared = Prepared.BUSY;
+                System.err.println("[asset-intercept] 503 (pool saturated) " + url);
+            }
             return true;
         }
 
@@ -135,11 +204,13 @@ public final class AssetRequestHandler extends CefRequestHandlerAdapter {
             if (!trusted(u, frame, initiator, config)) {
                 System.err.println("[asset-intercept] 403 " + url
                         + " — frame=" + safeFrameUrl(frame) + " initiator=" + initiator);
-                status = 403; errorCode = "FORBIDDEN"; reason = "Forbidden"; return;
+                prepared = error(403, "Forbidden", "FORBIDDEN"); return;
             }
-            if (!"GET".equals(method) && !"HEAD".equals(method)) { status = 405; errorCode = "BAD_REQUEST"; reason = "Method Not Allowed"; return; }
+            if (!"GET".equals(method) && !"HEAD".equals(method)) {
+                prepared = error(405, "Method Not Allowed", "BAD_REQUEST"); return;
+            }
             String[] seg = u.getRawPath().substring(PREFIX.length()).split("/", -1);
-            if (seg.length < 2) { status = 404; errorCode = "NOT_FOUND"; reason = "Not Found"; return; }
+            if (seg.length < 2) { prepared = error(404, "Not Found", "NOT_FOUND"); return; }
             String deck = decode(seg[0]);
             StringBuilder relative = new StringBuilder();
             for (int i = 1; i < seg.length; i++) {
@@ -147,74 +218,128 @@ public final class AssetRequestHandler extends CefRequestHandlerAdapter {
                 if (relative.length() > 0) relative.append('/');
                 relative.append(decode(seg[i]));
             }
-            path = fs.resolveHttpReadTarget(deck, relative.toString());
-            if (!Files.isRegularFile(path)) { status = 404; errorCode = "NOT_FOUND"; reason = "Not Found"; return; }
-            fileSize = Files.size(path); modified = Files.getLastModifiedTime(path).toMillis();
-            etag = "W/\"" + fileSize + "-" + modified + "\"";
-            mime = contentType(path.getFileName().toString());
+            Path path = fs.resolveHttpReadTarget(deck, relative.toString());
+            if (!Files.isRegularFile(path)) { prepared = error(404, "Not Found", "NOT_FOUND"); return; }
+            long fileSize = Files.size(path);
+            long modified = Files.getLastModifiedTime(path).toMillis();
+            String etag = "W/\"" + fileSize + "-" + modified + "\"";
+            String mime = contentType(path.getFileName().toString());
             if (etag.equals(ifNoneMatch) || (ifModifiedSince != null && !ifModifiedSince.isBlank()
                     && modified <= parseHttpDate(ifModifiedSince))) {
-                status = 304; reason = "Not Modified"; return;
+                prepared = new Prepared(304, "Not Modified", "", mime, fileSize, modified, 0, 0, etag, false, null);
+                return;
             }
-            offset = 0; remaining = fileSize; status = 200; reason = "OK";
+            long offset = 0, remainingBytes = fileSize;
+            int status = 200; String reason = "OK";
             if (range != null && !range.isBlank()) {
                 long[] r = parseRange(range, fileSize);
                 if (r == null) {
                     // unsupported range syntax (multi-range, malformed) — serve
                     // the FULL body (RFC 9110 allows ignoring the header)
-                    offset = 0; remaining = fileSize; status = 200; reason = "OK";
+                    offset = 0; remainingBytes = fileSize; status = 200; reason = "OK";
                 } else {
-                    offset = r[0]; remaining = r[1] - r[0] + 1; status = 206; reason = "Partial Content";
+                    offset = r[0]; remainingBytes = r[1] - r[0] + 1; status = 206; reason = "Partial Content";
                 }
             }
-            head = "HEAD".equals(method);
-            if (!head) { channel = FileChannel.open(path, StandardOpenOption.READ); channel.position(offset); }
+            boolean head = "HEAD".equals(method);
+            FileChannel channel = null;
+            if (!head && status != 304) {
+                channel = FileChannel.open(path, StandardOpenOption.READ);
+                channel.position(offset);
+            }
+            remaining.set(remainingBytes);
+            prepared = new Prepared(status, reason, "", mime, fileSize, modified, offset, remainingBytes,
+                    etag, head, channel);
+        }
+
+        private static Prepared error(int status, String reason, String code) {
+            return new Prepared(status, reason, code, "application/octet-stream", 0, 0, 0, 0, "", false, null);
         }
 
         @Override public void getResponseHeaders(CefResponse response, IntRef responseLength, StringRef redirectUrl) {
-            response.setStatus(status); response.setStatusText(reason); response.setMimeType(mime);
-            long len = status == 206 || status == 200 ? remaining : 0;
+            Prepared p = prepared;
+            response.setStatus(p.status); response.setStatusText(p.reason); response.setMimeType(p.mime);
+            long len = p.status == 206 || p.status == 200 ? p.remaining : 0;
             responseLength.set((int)Math.min(Integer.MAX_VALUE, len));
-            if (status != 304) response.setHeaderByName("Content-Length", Long.toString(len), true);
+            if (p.status != 304) response.setHeaderByName("Content-Length", Long.toString(len), true);
             response.setHeaderByName("X-Content-Type-Options", "nosniff", true);
-            if (status >= 400) response.setHeaderByName("X-Chasse-Error-Code", errorCode, true);
+            if (p.status >= 400) response.setHeaderByName("X-Chasse-Error-Code", p.errorCode, true);
             response.setHeaderByName("Cache-Control", "no-cache", true);
-            if (!etag.isEmpty() && status != 304) response.setHeaderByName("ETag", etag, true);
-            if (modified > 0 && status != 304) response.setHeaderByName("Last-Modified", httpDate(modified), true);
+            if (!p.etag.isEmpty() && p.status != 304) response.setHeaderByName("ETag", p.etag, true);
+            if (p.modified > 0 && p.status != 304) response.setHeaderByName("Last-Modified", httpDate(p.modified), true);
             response.setHeaderByName("Accept-Ranges", "bytes", true);
-            if (status == 206) response.setHeaderByName("Content-Range", "bytes " + offset + "-" + (offset + remaining - 1) + "/" + fileSize, true);
-            if (status == 416) response.setHeaderByName("Content-Range", "bytes */" + fileSize, true);
-            if ((status != 200 && status != 206) || head) log();
+            if (p.status == 206) response.setHeaderByName("Content-Range", "bytes " + p.offset + "-" + (p.offset + p.remaining - 1) + "/" + p.fileSize, true);
+            if (p.status == 416) response.setHeaderByName("Content-Range", "bytes */" + p.fileSize, true);
+            if ((p.status != 200 && p.status != 206) || p.head) log();
         }
 
         @Override public boolean read(byte[] dataOut, int bytesToRead, IntRef bytesRead, CefResourceReadCallback callback) {
-            if (head || remaining <= 0 || channel == null) { bytesRead.set(0); log(); return false; }
+            Prepared p = prepared;
+            if (p.head || p.channel == null || remaining.get() <= 0) { bytesRead.set(0); log(); return false; }
             bytesRead.set(0);
-            int count = (int)Math.min(Math.min(bytesToRead, dataOut.length), remaining);
-            IO.execute(() -> {
-                try {
-                    int n = channel.read(ByteBuffer.wrap(dataOut, 0, count));
-                    if (n < 0) n = 0;
-                    remaining -= n; bytesSent += n;
-                    callback.Continue(n);
-                    if (n == 0 || remaining == 0) {
-                        try { channel.close(); } catch (IOException ignored) {}
-                        log();
-                    }
-                } catch (Exception e) {
-                    System.err.println("[asset-intercept] read failed " + url + ": " + e.getMessage());
-                    callback.Continue(-2); log();
-                }
-            });
+            int count = (int)Math.min(Math.min(bytesToRead, dataOut.length), remaining.get());
+            FileChannel channel = p.channel;
+            // Continuation reads of an already-opened stream outrank new
+            // prepares (finish started work, release file handles, keep the
+            // number of in-flight large files bounded).
+            boolean accepted = WorkerPools.assetSubmit(
+                    critical ? WorkerPools.P_READ_CRITICAL : WorkerPools.P_READ,
+                    cancelled::get,
+                    () -> {
+                        try {
+                            if (cancelled.get() || remaining.get() <= 0) {
+                                return; // request died — do not touch the handler
+                            }
+                            int n = channel.read(ByteBuffer.wrap(dataOut, 0, count));
+                            if (n < 0) n = 0;
+                            remaining.addAndGet(-n);
+                            if (!cancelled.get()) {
+                                callback.Continue(n);
+                            }
+                            if (n == 0 || remaining.get() == 0) {
+                                closeChannel(channel);
+                                log();
+                            }
+                        } catch (Exception e) {
+                            if (!cancelled.get()) {
+                                System.err.println("[asset-intercept] read failed " + url + ": " + e.getMessage());
+                                callback.Continue(-2);
+                            }
+                            closeChannel(channel);
+                            log();
+                        }
+                    });
+            if (!accepted) {
+                // saturated: report a read failure for THIS request only
+                closeChannel(channel);
+                callback.Continue(-2);
+                log();
+            }
             return true;
         }
 
-        @Override public void cancel() { try { if (channel != null) channel.close(); } catch (IOException ignored) {} log(); }
-        private void log() {
-            if (logged) return; logged = true;
-            System.out.println("[asset-intercept] " + url + " status=" + status + " bytes=" + bytesSent + " ms=" + ((System.nanoTime()-started)/1_000_000));
+        private void closeChannel(FileChannel channel) {
+            try { channel.close(); } catch (IOException ignored) {}
         }
-        private boolean logged;
+
+        @Override public void cancel() {
+            // Per-request cancellation: flip this request's OWN flag, then close
+            // its channel. Queued pool tasks observe the flag and skip work.
+            cancelled.set(true);
+            Prepared p = prepared;
+            if (p != null && p.channel != null) closeChannel(p.channel);
+            log();
+        }
+
+        private void log() {
+            if (logged) return;
+            logged = true;
+            Prepared p = prepared;
+            long sent = p == null ? 0 : Math.max(0, p.remaining - remaining.get());
+            System.out.println("[asset-intercept] " + url + " status=" + (p == null ? 500 : p.status)
+                    + " bytes=" + sent + " ms=" + ((System.nanoTime()-started)/1_000_000)
+                    + (cancelled.get() ? " (cancelled)" : ""));
+        }
     }
 
     /**

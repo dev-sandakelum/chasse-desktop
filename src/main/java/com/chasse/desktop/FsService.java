@@ -41,7 +41,6 @@ import java.util.UUID;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
-
 /**
  * Owns the decks folder and every file operation on it (Desktop Bridge
  * Protocol v2 — the {@code fs} capability).
@@ -128,14 +127,20 @@ public final class FsService {
         final int slides;
         final String modified;
         final long modifiedMs;
+        /** Sort key with the finest precision available (file mtimes carry
+         *  nanoseconds; deck.json "modified" fields carry milliseconds) —
+         *  newest-first must stay deterministic even when two decks are
+         *  created within the same millisecond. */
+        final long sortKey;
 
-        DeckEntry(String id, String title, String folder, int slides, String modified, long modifiedMs) {
+        DeckEntry(String id, String title, String folder, int slides, String modified, long modifiedMs, long sortKey) {
             this.id = id;
             this.title = title;
             this.folder = folder;
             this.slides = slides;
             this.modified = modified;
             this.modifiedMs = modifiedMs;
+            this.sortKey = sortKey;
         }
     }
 
@@ -164,8 +169,13 @@ public final class FsService {
         final Path target, temp;
         final java.io.OutputStream out;
         long size;
+        /** Monotonic activity stamp — the TTL reaper aborts abandoned sessions. */
+        volatile long lastUsed = System.currentTimeMillis();
         AssetUpload(String deck, String relative, Path target, Path temp, java.io.OutputStream out) { this.deck=deck; this.relative=relative; this.target=target; this.temp=temp; this.out=out; }
     }
+
+    /** Upload sessions older than this (with no chunk written) are reaped. */
+    private static final long UPLOAD_IDLE_TTL_MS = 10 * 60_000L;
 
     /** Lazily dereferenced parent window for the native dialogs (set by Main). */
     private volatile Supplier<Window> dialogParent = () -> null;
@@ -180,6 +190,24 @@ public final class FsService {
         this.catalogFile = configFile.resolveSibling("catalog.json");
         loadConfig();
         loadCatalog();
+        // TTL reaper for abandoned streamed uploads: without it a crashed or
+        // closed page leaks its temp files AND its 256 MiB quota slice until
+        // the app exits (memory/disk control under sustained use).
+        WorkerPools.scheduleAtFixedRate(60_000L, 60_000L, this::reapAbandonedUploads);
+    }
+
+    /** Aborts upload sessions that have been idle longer than the TTL. */
+    private void reapAbandonedUploads() {
+        long cutoff = System.currentTimeMillis() - UPLOAD_IDLE_TTL_MS;
+        for (String id : assetUploads.keySet()) {
+            AssetUpload upload = assetUploads.get(id);
+            if (upload == null || upload.lastUsed >= cutoff) continue;
+            if (assetUploads.remove(id, upload)) {
+                abortAssetUpload(id);
+                System.err.println("[fs] reaped abandoned upload session " + id
+                        + " (" + upload.relative + " in " + upload.deck + ")");
+            }
+        }
     }
 
     /** Parent window for dialogs; dereferenced only when a dialog opens. */
@@ -682,7 +710,8 @@ public final class FsService {
     }
 
     private void rescanLocked(Path r) throws FsException {
-        Map<String, DeckEntry> out = new LinkedHashMap<>();
+        // ── Phase 1 (sequential): one readdir of the root + cheap filters ──
+        List<Path> candidates = new ArrayList<>();
         try (DirectoryStream<Path> ds = Files.newDirectoryStream(r)) {
             for (Path p : ds) {
                 // symlinked folders are skipped: a deck folder must be a REAL
@@ -695,40 +724,129 @@ public final class FsService {
                 if (!DECK_ID.matcher(name).matches()) {
                     continue;
                 }
-                Path deckJson = p.resolve("deck.json");
-                if (!Files.isRegularFile(deckJson)) {
+                if (!Files.isRegularFile(p.resolve("deck.json"))) {
                     continue;
                 }
-                String canonical = p.toRealPath().toString();
-                String id = deckIdForFolder(p, name);
-                synchronized (lock) {
-                    if (removedFolders.contains(canonical)) continue;
-                    Path known = catalog.get(id);
-                    if (known != null && !known.toAbsolutePath().normalize().equals(p.toRealPath())) continue;
-                    catalog.putIfAbsent(id, p.toRealPath());
-                }
-                out.put(id, readEntry(id, p, deckJson));
+                candidates.add(p);
             }
         } catch (IOException e) {
             throw new FsException(CODE_IO_ERROR, "could not scan the decks folder: " + e.getMessage());
         }
+
+        // ── Phase 2 (parallel, bounded): read + parse each deck.json ONCE ──
+        // (the old code read every deck.json twice — once for the id, once
+        // for the metadata — and one folder at a time)
+        List<ScannedDeck> scanned = WorkerPools.parallelMap(
+                candidates, WorkerPools.IO_THREADS, WorkerPools.NEVER_CANCELLED,
+                FsService::scanOneDeck, null);
+
+        // ── Phase 3: merge against the catalog (short critical sections) ──
+        Map<String, Path> catalogCopy;
+        Set<String> removedCopy;
         synchronized (lock) {
-            for (Map.Entry<String, Path> entry : catalog.entrySet()) {
-                Path folder = entry.getValue();
-                try {
-                    if (Files.isDirectory(folder) && Files.isRegularFile(folder.resolve("deck.json"))) {
-                        out.put(entry.getKey(), readEntry(entry.getKey(), folder, folder.resolve("deck.json")));
-                    }
-                } catch (Exception ignored) {
-                    // Keep a missing catalog entry out of this response; file operations report its real error.
+            catalogCopy = new LinkedHashMap<>(catalog);
+            removedCopy = new HashSet<>(removedFolders);
+        }
+        Map<String, DeckEntry> out = new LinkedHashMap<>();
+        Map<String, Path> scannedPaths = new HashMap<>();      // id → real path
+        List<ScannedDeck> adoptions = new ArrayList<>();
+        for (ScannedDeck s : scanned) {
+            if (s == null) continue;                            // unreadable — tolerated, as before
+            if (removedCopy.contains(s.canonical)) continue;
+            Path known = catalogCopy.get(s.id);
+            if (known != null && !known.toAbsolutePath().normalize().equals(s.real)) continue;
+            if (known == null) adoptions.add(s);
+            out.put(s.id, s.entry);
+            scannedPaths.put(s.id, s.real);
+        }
+        if (!adoptions.isEmpty()) {
+            synchronized (lock) {
+                for (ScannedDeck s : adoptions) {
+                    catalog.putIfAbsent(s.id, s.real);
                 }
             }
         }
+
+        // ── Phase 4 (parallel): catalog decks not already scanned above ──
+        List<Map.Entry<String, Path>> pendingExternals = new ArrayList<>();
+        for (Map.Entry<String, Path> entry : catalogCopy.entrySet()) {
+            Path scannedReal = scannedPaths.get(entry.getKey());
+            if (scannedReal != null && scannedReal.equals(entry.getValue())) {
+                continue; // same folder already scanned in phase 2
+            }
+            pendingExternals.add(entry);
+        }
+        List<DeckEntry> externals = WorkerPools.parallelMap(
+                pendingExternals, WorkerPools.IO_THREADS, WorkerPools.NEVER_CANCELLED,
+                e -> {
+                    Path folder = e.getValue();
+                    try {
+                        if (Files.isDirectory(folder) && Files.isRegularFile(folder.resolve("deck.json"))) {
+                            return readEntry(e.getKey(), folder, folder.resolve("deck.json"));
+                        }
+                    } catch (Exception ignored) {
+                        // Keep a missing catalog entry out of this response; file operations report its real error.
+                    }
+                    return null;
+                }, null);
+        for (int i = 0; i < pendingExternals.size(); i++) {
+            DeckEntry entry = externals.get(i);
+            if (entry != null) {
+                out.put(pendingExternals.get(i).getKey(), entry);
+            }
+        }
+
         List<DeckEntry> sorted = new ArrayList<>(out.values());
-        sorted.sort(Comparator.comparingLong((DeckEntry e) -> e.modifiedMs).reversed());
+        sorted.sort(Comparator.comparingLong((DeckEntry e) -> e.sortKey).reversed());
         cache = sorted;
         lastScan = System.currentTimeMillis();
         saveCatalog();
+    }
+
+    /** One scanned root deck folder — id + metadata from a SINGLE deck.json read. */
+    private static final class ScannedDeck {
+        final String id;
+        final String canonical;   // toRealPath().toString() (skip-list key)
+        final Path real;          // toRealPath() (catalog value)
+        final DeckEntry entry;
+        ScannedDeck(String id, String canonical, Path real, DeckEntry entry) {
+            this.id = id; this.canonical = canonical; this.real = real; this.entry = entry;
+        }
+    }
+
+    /**
+     * Reads one deck folder's deck.json ONCE and derives both its id and its
+     * list entry from the same parse. Any per-deck failure is tolerated
+     * (returns null) exactly like the old deckIdForFolder + readEntry pair:
+     * an unreadable deck.json still lists the folder with the folder-name
+     * fallback id, and a folder that yields no valid id is skipped.
+     */
+    private static ScannedDeck scanOneDeck(Path p) {
+        try {
+            Path deckJson = p.resolve("deck.json");
+            Path real = p.toRealPath();
+            String canonical = real.toString();
+            String name = p.getFileName().toString();
+            JsonObject o = null;
+            try {
+                o = JsonParser.parseString(Files.readString(deckJson, StandardCharsets.UTF_8)).getAsJsonObject();
+            } catch (Exception ignored) {
+                // unreadable/unparseable — tolerated (see readEntry)
+            }
+            String id = null;
+            if (o != null) {
+                JsonElement idEl = o.get("id");
+                if (idEl != null && idEl.isJsonPrimitive() && DECK_ID.matcher(idEl.getAsString()).matches()) {
+                    id = idEl.getAsString();
+                }
+            }
+            if (id == null) {
+                id = name; // legacy/default-root fallback (folder name already matches DECK_ID)
+            }
+            return new ScannedDeck(id, canonical, real, entryFromJson(id, p, deckJson, o));
+        } catch (Exception e) {
+            return null; // one bad folder never breaks the scan
+        }
     }
 
     private DeckEntry readEntry(String id, Path dir, Path deckJson) {
@@ -736,34 +854,73 @@ public final class FsService {
         int slides = 0;
         String modified = null;
         long modifiedMs = 0;
+        long sortKey = 0;
         try {
-            modifiedMs = Files.getLastModifiedTime(deckJson).toMillis();
+            java.nio.file.attribute.FileTime mtime = Files.getLastModifiedTime(deckJson);
+            modifiedMs = mtime.toMillis();
+            sortKey = sortKeyOf(mtime);
             modified = Instant.ofEpochMilli(modifiedMs).toString();
             JsonObject o = JsonParser.parseString(Files.readString(deckJson, StandardCharsets.UTF_8))
                     .getAsJsonObject();
-            JsonElement t = o.get("title");
-            if (t != null && t.isJsonPrimitive() && !t.getAsString().isBlank()) {
-                title = t.getAsString();
-            }
-            JsonElement s = o.get("slides");
-            if (s != null && s.isJsonArray()) {
-                slides = s.getAsJsonArray().size();
-            }
-            JsonElement m = o.get("modified");
-            if (m != null && m.isJsonPrimitive()) {
-                try {
-                    Instant inst = Instant.parse(m.getAsString());
-                    modified = m.getAsString();
-                    modifiedMs = inst.toEpochMilli();
-                } catch (DateTimeParseException ignored) {
-                    // keep the file mtime
-                }
-            }
+            return entryFromJson(id, dir, deckJson, o);
         } catch (Exception ignored) {
             // unreadable/unparseable deck.json — still list the folder (title
             // falls back to the folder name); reads/writes surface real errors
         }
-        return new DeckEntry(id, title, dir.toString(), slides, modified, modifiedMs);
+        return new DeckEntry(id, title, dir.toString(), slides, modified, modifiedMs, sortKey);
+    }
+
+    /** Entry metadata from an ALREADY-PARSED deck.json object. */
+    private static DeckEntry entryFromJson(String id, Path dir, Path deckJson, JsonObject o) {
+        String title = id;
+        int slides = 0;
+        String modified = null;
+        long modifiedMs = 0;
+        long sortKey = 0;
+        try {
+            java.nio.file.attribute.FileTime mtime = Files.getLastModifiedTime(deckJson);
+            modifiedMs = mtime.toMillis();
+            sortKey = sortKeyOf(mtime);
+            modified = Instant.ofEpochMilli(modifiedMs).toString();
+        } catch (Exception ignored) {
+            // mtime is best-effort; modifiedMs stays 0
+        }
+        if (o != null) {
+            try {
+                JsonElement t = o.get("title");
+                if (t != null && t.isJsonPrimitive() && !t.getAsString().isBlank()) {
+                    title = t.getAsString();
+                }
+                JsonElement s = o.get("slides");
+                if (s != null && s.isJsonArray()) {
+                    slides = s.getAsJsonArray().size();
+                }
+                JsonElement m = o.get("modified");
+                if (m != null && m.isJsonPrimitive()) {
+                    try {
+                        Instant inst = Instant.parse(m.getAsString());
+                        modified = m.getAsString();
+                        modifiedMs = inst.toEpochMilli();
+                        sortKey = modifiedMs;
+                    } catch (DateTimeParseException ignored) {
+                        // keep the file mtime
+                    }
+                }
+            } catch (Exception ignored) {
+                // malformed metadata — keep the fallbacks
+            }
+        }
+        return new DeckEntry(id, title, dir.toString(), slides, modified, modifiedMs, sortKey);
+    }
+
+    /** Nanosecond-precision sort key of a file mtime (falls back to millis). */
+    private static long sortKeyOf(java.nio.file.attribute.FileTime t) {
+        try {
+            java.time.Instant i = t.toInstant();
+            return i.getEpochSecond() * 1_000_000_000L + i.getNano();
+        } catch (Exception e) {
+            return t.toMillis();
+        }
     }
 
     /** Uses deck.json's id for linked folders; the folder name is only the
@@ -904,13 +1061,49 @@ public final class FsService {
         }
         try {
             Files.createDirectories(dir);
-            for (Map.Entry<String, byte[]> e : toWrite.entrySet()) {
-                if ("deck.json".equals(e.getKey())) {
-                    continue; // index last
+            // Parallel bounded writes for everything except the index file;
+            // deck.json stays LAST (the folder-is-project convention: an
+            // unfinished deck never looks complete). The first failure raises
+            // the per-task cancel flag (remaining queued writes are skipped)
+            // and the whole folder is cleaned up — never a half deck.
+            WorkerPools.Flag failed = new WorkerPools.Flag();
+            List<Throwable> errors = java.util.Collections.synchronizedList(new ArrayList<>());
+            List<String> writable = new ArrayList<>();
+            for (String p : toWrite.keySet()) {
+                if (!"deck.json".equals(p)) {
+                    writable.add(p);
                 }
-                atomicWriteBytes(resolveConfined(dir, e.getKey()), e.getValue());
+            }
+            WorkerPools.parallelMap(
+                    writable, WorkerPools.IO_THREADS, failed,
+                    p -> {
+                        try {
+                            atomicWriteBytes(resolveConfined(dir, p), toWrite.get(p));
+                        } catch (Throwable t) {
+                            failed.cancel();
+                            errors.add(t);
+                        }
+                        return Boolean.TRUE;
+                    }, null);
+            if (!errors.isEmpty()) {
+                Throwable first = errors.get(0);
+                if (first instanceof FsException fe) {
+                    throw fe;
+                }
+                throw first instanceof IOException io ? io : new IOException(first);
             }
             atomicWriteBytes(resolveConfined(dir, "deck.json"), toWrite.get("deck.json"));
+            // Stamp a FINE-GRAINED mtime: filesystems update file times from a
+            // coarse clock (observed ~32 ms windows), so decks created in quick
+            // succession can end up with byte-identical timestamps and the
+            // newest-first scan order becomes a coin flip. An explicit
+            // realtime-clock stamp keeps the ordering deterministic.
+            try {
+                Files.setLastModifiedTime(dir.resolve("deck.json"),
+                        java.nio.file.attribute.FileTime.from(Instant.now()));
+            } catch (IOException ignored) {
+                // best effort — coarse mtime keeps the old behaviour
+            }
         } catch (IOException | FsException e) {
             deleteTreeBestEffort(dir);
             if (e instanceof FsException fe) {
@@ -1111,12 +1304,37 @@ public final class FsService {
         }
         try {
             Files.createDirectories(dst);
+            // Parallel bounded copies (the old loop copied one file at a
+            // time — slow on asset-heavy decks). Targets are resolved BEFORE
+            // the fan-out (containment checks stay sequential and cheap), the
+            // first failure raises the per-task cancel flag so queued copies
+            // are skipped, deck.json is patched and written LAST as before,
+            // and a failed copy still cleans up — never a half deck.
+            record Copy(Path source, Path target) {}
+            List<Copy> copies = new ArrayList<>();
             for (Path f : files) {
                 String rel = src.relativize(f).toString().replace('\\', '/');
                 if ("deck.json".equals(rel)) {
                     continue; // written last, patched
                 }
-                copyFileAtomic(f, resolveConfined(dst, rel));
+                copies.add(new Copy(f, resolveConfined(dst, rel)));
+            }
+            WorkerPools.Flag failed = new WorkerPools.Flag();
+            List<Throwable> errors = java.util.Collections.synchronizedList(new ArrayList<>());
+            WorkerPools.parallelMap(
+                    copies, WorkerPools.IO_THREADS, failed,
+                    copy -> {
+                        try {
+                            copyFileAtomic(copy.source(), copy.target());
+                        } catch (Throwable t) {
+                            failed.cancel();
+                            errors.add(t);
+                        }
+                        return Boolean.TRUE;
+                    }, null);
+            if (!errors.isEmpty()) {
+                Throwable first = errors.get(0);
+                throw first instanceof IOException io ? io : new IOException(first);
             }
             String json = Files.readString(src.resolve("deck.json"), StandardCharsets.UTF_8);
             JsonObject deckJson;
@@ -1175,25 +1393,39 @@ public final class FsService {
             throw ioOf(e, "list " + dir);
         }
         names.sort(String::compareTo);
-        for (String name : names) {
-            Path p = target.resolve(name);
-            JsonObject o = new JsonObject();
-            o.addProperty("name", name);
-            boolean isDir = Files.isDirectory(p);
-            o.addProperty("directory", isDir);
-            long size = 0;
-            long mtime = 0;
-            try {
-                if (!isDir) {
-                    size = Files.size(p);
-                }
-                mtime = Files.getLastModifiedTime(p).toMillis();
-            } catch (IOException ignored) {
-                // unreadable metadata — report zeros
+        // Parallel metadata: one Files.readAttributes per entry (the old code
+        // issued 2–3 separate syscalls per entry, sequentially). Results are
+        // index-addressed, so the JSON order stays exactly the sorted order.
+        final Path folder = target;
+        List<JsonObject> rows = WorkerPools.parallelMap(
+                names, WorkerPools.IO_THREADS, WorkerPools.NEVER_CANCELLED,
+                name -> {
+                    Path p = folder.resolve(name);
+                    JsonObject o = new JsonObject();
+                    o.addProperty("name", name);
+                    long size = 0;
+                    long mtime = 0;
+                    boolean isDir = false;
+                    try {
+                        java.nio.file.attribute.BasicFileAttributes a =
+                                Files.readAttributes(p, java.nio.file.attribute.BasicFileAttributes.class);
+                        isDir = a.isDirectory();
+                        if (!isDir) {
+                            size = a.size();
+                        }
+                        mtime = a.lastModifiedTime().toMillis();
+                    } catch (IOException ignored) {
+                        // unreadable metadata — report zeros (as before)
+                    }
+                    o.addProperty("directory", isDir);
+                    o.addProperty("size", size);
+                    o.addProperty("modified", mtime);
+                    return o;
+                }, null);
+        for (JsonObject row : rows) {
+            if (row != null) {
+                arr.add(row);
             }
-            o.addProperty("size", size);
-            o.addProperty("modified", mtime);
-            arr.add(o);
         }
         return arr;
     }
@@ -1344,8 +1576,36 @@ public final class FsService {
         } catch (IOException e) {
             throw ioOf(e, "scan " + dir.getFileName());
         }
-        List<String> failures = new ArrayList<>();
+        // Files are deleted in parallel (bounded); directories stay
+        // sequential in deepest-first order — a parent cannot be removed
+        // before its children, and there is no ordering constraint between
+        // files of different subtrees. Every failure is collected (one locked
+        // file never aborts the others), exactly like the old loop.
+        List<Path> fileList = new ArrayList<>();
+        List<Path> dirList = new ArrayList<>();
         for (Path p : order) {
+            try {
+                if (Files.isDirectory(p) && !Files.isSymbolicLink(p)) {
+                    dirList.add(p);
+                } else {
+                    fileList.add(p);
+                }
+            } catch (Exception ambiguous) {
+                fileList.add(p);
+            }
+        }
+        List<String> failures = java.util.Collections.synchronizedList(new ArrayList<>());
+        WorkerPools.parallelMap(
+                fileList, WorkerPools.IO_THREADS, WorkerPools.NEVER_CANCELLED,
+                p -> {
+                    try {
+                        Files.delete(p);
+                    } catch (IOException e) {
+                        failures.add(p.getFileName() + ": " + reasonOf(e));
+                    }
+                    return Boolean.TRUE;
+                }, null);
+        for (Path p : dirList) {
             try {
                 Files.delete(p);
             } catch (IOException e) {
@@ -1368,13 +1628,38 @@ public final class FsService {
 
     private static void deleteTreeBestEffort(Path dir) {
         try (Stream<Path> walk = Files.walk(dir)) {
-            walk.sorted(Comparator.reverseOrder()).forEach(p -> {
+            List<Path> order = walk.sorted(Comparator.reverseOrder())
+                    .collect(java.util.stream.Collectors.toList());
+            List<Path> fileList = new ArrayList<>();
+            List<Path> dirList = new ArrayList<>();
+            for (Path p : order) {
+                try {
+                    if (Files.isDirectory(p) && !Files.isSymbolicLink(p)) {
+                        dirList.add(p);
+                    } else {
+                        fileList.add(p);
+                    }
+                } catch (Exception ambiguous) {
+                    fileList.add(p);
+                }
+            }
+            WorkerPools.parallelMap(
+                    fileList, WorkerPools.IO_THREADS, WorkerPools.NEVER_CANCELLED,
+                    p -> {
+                        try {
+                            Files.delete(p);
+                        } catch (IOException ignored) {
+                            // best effort — a partial failure just leaves files to retry
+                        }
+                        return Boolean.TRUE;
+                    }, null);
+            for (Path p : dirList) {
                 try {
                     Files.delete(p);
                 } catch (IOException ignored) {
-                    // best effort — a partial failure just leaves files to retry
+                    // best effort
                 }
-            });
+            }
         } catch (IOException ignored) {
             // best effort
         }

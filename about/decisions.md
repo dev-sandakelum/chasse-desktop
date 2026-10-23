@@ -197,3 +197,45 @@ lives is the highest-value use of JUnit here.
 **Why:** keeps the dev build trivial and the jar small, while end-user
 installers work fully offline. The install dir is a cache — safe to delete,
 re-downloaded.
+
+## 17. Central worker pools (`WorkerPools`) instead of ad-hoc executors
+
+**Decision:** every background executor lives in one place
+(`WorkerPools.java`): `chasse-io-N` (parallel disk fan-out, caller-runs
+rejection so fan-out can never deadlock), `chasse-fs-N` + `chasse-bridge-N`
+(bounded queues; saturation answers the page with `BUSY` instead of growing
+threads), `chasse-asset-N` (priority-ordered, semaphore-bounded), a one-shot
+startup pool and a scheduler for TTL reapers. All pools have named daemon
+threads and are drained by a shutdown hook.
+
+**Why:** the old code had two unbounded cached pools (`fs-worker` could grow
+one thread per queued upload chunk) and a fixed 16-thread anonymous asset
+pool with no priority and no cooperative cancellation. One seam also fixes
+the cross-thread visibility bug in `AssetResourceHandler` (fields written by
+`prepare()` on a pool thread and read on the CEF thread now travel through an
+immutable `Prepared` snapshot) and lets `FsService` fan out scans/copies/
+deletes through `parallelMap` — input-ordered results, per-task cancel flags,
+one failure never stops the others. Pool sizing is measured, not guessed:
+`FsBenchmark`'s latency sweep (`-Dbench=1`) showed >2 disk workers add
+nothing on a 2-core host (1.99× at parallelism 2, flat beyond), matching
+`IO_THREADS = clamp(cores/2, 2, 6)`.
+
+## 18. Parallel `FsService` operations keep the same contracts
+
+**Decision:** `rescanLocked` reads each deck.json ONCE (the old scan read it
+twice per deck), fans out per-deck reads on the IO pool, and swaps the cache
+under a short critical section; `createDeck`/`duplicateDeck` write files in a
+bounded parallel batch (deck.json still last, failures cancel the remainder
+and clean up); `deleteTree*` deletes files in parallel and directories
+deepest-first sequentially; `listFiles` stats via one `readAttributes` per
+entry.
+
+**Why:** these are the loading paths the web app blocks on. The parallel
+mechanism halves the per-deck syscalls and hides per-file latency (measured
+1.99× on the simulated 2 ms/op disk; more on real HDD+antivirus). Correctness
+invariants are preserved exactly: the folder-is-project convention
+(deck.json last), tolerance of unreadable deck.json files, verified deletes,
+and the `scanLock` → `lock` ordering. One subtle fix this forced: newest-first
+ordering now uses nanosecond-precision sort keys plus an explicit deck.json
+mtime stamp, because filesystem coarse clocks (~32 ms windows observed) made
+two decks created in the same window compare equal and flipped the order.

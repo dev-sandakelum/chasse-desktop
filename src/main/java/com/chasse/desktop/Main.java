@@ -52,6 +52,7 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.Future;
 
 /**
  * Chassé Studio Desktop — entry point.
@@ -109,13 +110,13 @@ public final class Main {
             System.exit(0);
             return;
         }
-        SyncRooms rooms    = new SyncRooms();
-        ServerManager servers = new ServerManager(config, rooms);
         if (config.headless() || config.room() != null) {
+            SyncRooms rooms = new SyncRooms();
+            ServerManager servers = new ServerManager(config, rooms);
             runHeadless(config, rooms, servers);
             return;
         }
-        runGui(config, rooms, servers);
+        runGui(config);
     }
 
     // =========================================================================
@@ -164,11 +165,40 @@ public final class Main {
     // GUI mode
     // =========================================================================
 
-    private static void runGui(AppConfig config, SyncRooms rooms, ServerManager servers) {
+    /** Decoded once, off the EDT, while the rest of startup proceeds. */
+    private static final class StartupAssets {
+        final List<Image> windowIcons;
+        final Image badgeLogo;
+        StartupAssets(List<Image> windowIcons, Image badgeLogo) {
+            this.windowIcons = windowIcons;
+            this.badgeLogo = badgeLogo;
+        }
+    }
+
+    private static void runGui(AppConfig config) {
         AtomicReference<JFrame> frameRef       = new AtomicReference<>();
         AtomicBoolean           shutdownStarted = new AtomicBoolean(false);
         try {
-            servers.log("info", "Desktop app started");
+            // ── Parallel startup ────────────────────────────────────────────
+            // JCEF initialisation is the slow step (a ~100 MB Chromium
+            // download on first run). Everything that does NOT touch AWT/Swing
+            // — the sync rooms, the LAN scan inside ServerManager, the FsService
+            // config/catalog load and its root health check — runs concurrently
+            // on the startup pool instead of serially on the main thread.
+            // (JCEF must still be initialised before any Swing/GTK call, so the
+            // icon decode below is only SUBMITTED after the JCEF build.)
+            Future<SyncRooms> roomsFuture = WorkerPools.startup(SyncRooms::new);
+            Future<StartupServices> servicesFuture = WorkerPools.startup(() -> {
+                SyncRooms rooms = roomsFuture.get();
+                ServerManager servers = new ServerManager(config, rooms);
+                servers.log("info", "Desktop app started");
+                return new StartupServices(rooms, servers);
+            });
+            Future<FsService> fsFuture = WorkerPools.startup(() -> {
+                FsService fsService = new FsService();
+                fsService.setDialogParent(() -> frameRef.get() == null ? null : frameRef.get());
+                return fsService;
+            });
 
             // 1. JCEF must be initialised before any Swing/GTK call on Linux
             CefAppBuilder builder = new CefAppBuilder();
@@ -193,6 +223,11 @@ public final class Main {
             builder.setAppHandler(new MavenCefAppHandlerAdapter() {});
             CefApp cefApp = builder.build();
 
+            // JCEF is up: the window icons + badge logo decode on the startup
+            // pool NOW (they used to run on the EDT during the first paint —
+            // ImageIO.read + six getScaledInstance calls, ~50 ms of dead UI).
+            Future<StartupAssets> assetsFuture = WorkerPools.startup(Main::decodeStartupAssets);
+
             // 2. LAF (best-effort; we paint everything ourselves anyway)
             try { UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName()); }
             catch (Exception ignored) {}
@@ -204,12 +239,21 @@ public final class Main {
                 config.saveUserAppUrl(url);
             }
 
+            // collect the parallel startup work (all of it is long done by now)
+            SyncRooms rooms = roomsFuture.get();
+            ServerManager servers = servicesFuture.get().servers();
+            final FsService fsService = fsFuture.get();
+            StartupAssets assets;
+            try {
+                assets = assetsFuture.get();
+            } catch (Exception e) {
+                assets = new StartupAssets(List.of(), null);
+            }
+
             servers.log("info", "Loading " + config.appUrl());
             CefClient client = cefApp.createClient();
 
             // 4. bridge + same-origin virtual asset interception.
-            final FsService fsService = new FsService();
-            fsService.setDialogParent(() -> frameRef.get() == null ? null : frameRef.get());
             com.google.gson.JsonObject rootInfo = fsService.getRoot();
             servers.log("info", "Decks folder: "
                     + (rootInfo.get("configured").getAsBoolean()
@@ -253,13 +297,13 @@ public final class Main {
             }));
 
             // 6. Swing window — undecorated so the OS title bar is gone
+            final StartupAssets startupAssets = assets;
             SwingUtilities.invokeLater(() -> {
                 JFrame frame = new JFrame(APP_NAME + " \u2014 " + APP_SUBTITLE);
                 frame.setUndecorated(true);          // ← remove OS chrome
                 frameRef.set(frame);
 
-                List<Image> icons = loadIconImages();
-                if (!icons.isEmpty()) frame.setIconImages(icons);
+                if (!startupAssets.windowIcons.isEmpty()) frame.setIconImages(startupAssets.windowIcons);
 
                 frame.setSize(1280, 720);
                 frame.setMinimumSize(new Dimension(980, 640));
@@ -267,7 +311,7 @@ public final class Main {
 
                 // custom title bar
                 TitleBar titleBar = new TitleBar(frame, config, browser,
-                        () -> shutdown(shutdownStarted, servers, browser, cefApp));
+                        () -> shutdown(shutdownStarted, servers, browser, cefApp), startupAssets.badgeLogo);
                 frame.add(titleBar, BorderLayout.NORTH);
                 frame.add(browser.getUIComponent(), BorderLayout.CENTER);
 
@@ -295,6 +339,9 @@ public final class Main {
                                 default       -> toggleFullscreen(frame, titleBar);
                             }
                         }));
+
+                // the parallel startup phase is over — release its threads
+                WorkerPools.startupDone();
             });
         } catch (Throwable t) {
             t.printStackTrace();
@@ -327,7 +374,7 @@ public final class Main {
         private Point dragOrigin;
         private Point frameOrigin;
 
-        TitleBar(JFrame frame, AppConfig config, CefBrowser browser, Runnable shutdown) {
+        TitleBar(JFrame frame, AppConfig config, CefBrowser browser, Runnable shutdown, Image badgeLogo) {
             setLayout(new BorderLayout());
             setOpaque(true);
             setBackground(BAR_BG);
@@ -338,7 +385,7 @@ public final class Main {
             JPanel left = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
             left.setOpaque(false);
             left.setBorder(BorderFactory.createEmptyBorder(0, 8, 0, 0));
-            left.add(new BadgeIcon());
+            left.add(new BadgeIcon(badgeLogo));
             left.add(hgap(8));
             left.add(titleLabel(APP_NAME,     true,  BAR_FG));
             left.add(titleLabel(" \u2014 ",   false, BAR_MUTED));
@@ -388,24 +435,17 @@ public final class Main {
         void setBarVisible(boolean v) { setVisible(v); }
     }
 
-    // ── badge: app Logo.png scaled to fit ────────────────────────────────────
+    // ── badge: app Logo.png scaled to fit (decoded off the EDT at startup) ──
 
     private static final class BadgeIcon extends JPanel {
         private static final int S = 24;
         private final Image logo;
 
-        BadgeIcon() {
+        /** @param logo pre-decoded scaled logo (null → painted fallback square) */
+        BadgeIcon(Image logo) {
+            this.logo = logo;
             setOpaque(false);
             setPreferredSize(new Dimension(S + 4, S + 4));
-            // load Logo.png from classpath; fall back to null (painted as coloured square)
-            Image loaded = null;
-            try (InputStream in = Main.class.getResourceAsStream("/Logo.png")) {
-                if (in != null) {
-                    Image raw = ImageIO.read(in);
-                    if (raw != null) loaded = raw.getScaledInstance(S, S, Image.SCALE_SMOOTH);
-                }
-            } catch (IOException ignored) {}
-            logo = loaded;
         }
 
         @Override protected void paintComponent(Graphics g) {
@@ -718,18 +758,34 @@ public final class Main {
         return l;
     }
 
-    private static List<Image> loadIconImages() {
+    /** Holder for the two startup services constructed off the main thread. */
+    private record StartupServices(SyncRooms rooms, ServerManager servers) {}
+
+    /** Decodes the window icons and the title-bar badge off the EDT. */
+    private static StartupAssets decodeStartupAssets() {
         List<Image> images = new ArrayList<>();
+        Image badge = null;
         try (InputStream in = Main.class.getResourceAsStream("/Logo.png")) {
-            if (in == null) { System.err.println("Warning: Logo.png not found"); return images; }
-            Image base = ImageIO.read(in);
-            if (base == null) { System.err.println("Warning: Logo.png unreadable"); return images; }
-            for (int size : new int[]{16, 32, 48, 64, 128, 256})
-                images.add(base.getScaledInstance(size, size, Image.SCALE_SMOOTH));
+            if (in == null) {
+                System.err.println("Warning: Logo.png not found");
+            } else {
+                Image base = ImageIO.read(in);
+                if (base == null) {
+                    System.err.println("Warning: Logo.png unreadable");
+                } else {
+                    badge = base.getScaledInstance(24, 24, Image.SCALE_SMOOTH);
+                    for (int size : new int[]{16, 32, 48, 64, 128, 256})
+                        images.add(base.getScaledInstance(size, size, Image.SCALE_SMOOTH));
+                }
+            }
         } catch (IOException e) {
             System.err.println("Warning: could not load Logo.png: " + e.getMessage());
         }
-        return images;
+        return new StartupAssets(images, badge);
+    }
+
+    private static List<Image> loadIconImages() {
+        return decodeStartupAssets().windowIcons;
     }
 
     private static String promptForAppUrl(String current) {

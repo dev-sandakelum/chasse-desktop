@@ -16,7 +16,6 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-
 /**
  * Owns the embedded LAN sync server (Javalin: HTTP + WebSocket on one port)
  * plus its observable state: status, log ring buffer (last 200 lines) and the
@@ -61,7 +60,28 @@ public final class ServerManager {
     private final PhoneWsHandler phoneWs;
     private final Gson gson = new Gson();
     private final List<Listener> listeners = new CopyOnWriteArrayList<>();
+    /** Log ring lock — deliberately NOT the instance monitor, so a blocking
+     *  {@link #stop()} (which holds the instance monitor while Javalin shuts
+     *  down) can never stall log reads from the bridge. */
+    private final Object logLock = new Object();
     private final ArrayDeque<LogLine> logRing = new ArrayDeque<>();
+
+    /** Immutable, lock-free status snapshot for the CEF/bridge threads. */
+    private static final class Snapshot {
+        final Status status;
+        final List<LanAddresses.LanAddress> addresses;
+        final String selectedAddress;
+        final String lastError;
+        Snapshot(Status status, List<LanAddresses.LanAddress> addresses,
+                 String selectedAddress, String lastError) {
+            this.status = status;
+            this.addresses = addresses;
+            this.selectedAddress = selectedAddress;
+            this.lastError = lastError;
+        }
+    }
+
+    private volatile Snapshot snap = new Snapshot(Status.STOPPED, new ArrayList<>(), null, null);
 
     private Status status = Status.STOPPED;
     private String lastError = null;
@@ -80,6 +100,7 @@ public final class ServerManager {
         // initial address scan (reported even while the server is stopped)
         this.addresses = LanAddresses.scan(config.preferredPrefix());
         this.selectedAddress = LanAddresses.pickPreferred(this.addresses);
+        publishSnapshot();
         // watch the network forever (daemon thread, 5s poll)
         LanAddresses.startWatcher(config.preferredPrefix(), 5_000L, this::onAddressesChanged);
     }
@@ -106,6 +127,7 @@ public final class ServerManager {
         } catch (IOException e) {
             lastError = "Port " + port + " is already in use — close the other program or change server.port";
             status = Status.ERROR;
+            publishSnapshot();
             log("error", lastError);
             fireStatus();
             return;
@@ -135,6 +157,7 @@ public final class ServerManager {
                     status = Status.RUNNING;
                     startedAt = System.currentTimeMillis();
                     startHeartbeatLocked();
+                    publishSnapshot();
                     log("info", "Sync server running on port " + port);
                     fireStatus();
                 }
@@ -151,6 +174,7 @@ public final class ServerManager {
                 lastError = "Failed to start sync server: " + t.getMessage();
                 status = Status.ERROR;
                 stopHeartbeatLocked();
+                publishSnapshot();
                 log("error", lastError);
                 fireStatus();
             }
@@ -179,6 +203,7 @@ public final class ServerManager {
         }
         status = Status.STOPPED;
         lastError = null;
+        publishSnapshot();
         log("info", "Sync server stopped");
         fireStatus();
     }
@@ -225,6 +250,7 @@ public final class ServerManager {
             if (selectedAddress == null || indexOfAddress(selectedAddress) < 0) {
                 selectedAddress = LanAddresses.pickPreferred(addresses);
             }
+            publishSnapshot();
             log("info", "Network interfaces changed: " + formatAddresses(addresses));
             fireStatus(); // always fire on network changes
         }
@@ -234,6 +260,7 @@ public final class ServerManager {
     public synchronized void selectAddress(String address) {
         if (address != null && indexOfAddress(address) >= 0) {
             selectedAddress = address;
+            publishSnapshot();
             fireStatus();
         }
     }
@@ -266,39 +293,46 @@ public final class ServerManager {
     /* Status snapshot / diagnostics                                       */
     /* ------------------------------------------------------------------ */
 
-    /** Best address for links (selected or loopback fallback). */
-    public synchronized String bestAddress() {
-        return selectedAddress != null ? selectedAddress : "127.0.0.1";
+    /** Best address for links (selected or loopback fallback) — lock-free. */
+    public String bestAddress() {
+        String selected = snap.selectedAddress;
+        return selected != null ? selected : "127.0.0.1";
     }
 
     /**
      * Full status snapshot for the bridge's getServerStatus:
-     * {status, port, addresses, selectedAddress, error}.
+     * {status, port, addresses, selectedAddress, error} — lock-free (a
+     * blocking stop() used to freeze every reader for the whole Javalin
+     * shutdown).
      */
-    public synchronized JsonObject statusSnapshot() {
+    public JsonObject statusSnapshot() {
+        Snapshot s = snap;
         JsonObject o = new JsonObject();
-        o.addProperty("status", statusString());
+        o.addProperty("status", statusString(s.status));
         o.addProperty("port", port);
-        o.add("addresses", addressesArray());
-        o.addProperty("selectedAddress", selectedAddress);
-        o.add("error", lastError == null ? JsonNull.INSTANCE : gson.toJsonTree(lastError));
+        o.add("addresses", addressesArray(s.addresses));
+        o.addProperty("selectedAddress", s.selectedAddress);
+        o.add("error", s.lastError == null ? JsonNull.INSTANCE : gson.toJsonTree(s.lastError));
         return o;
     }
 
     /**
      * Ring-buffer snapshot for the bridge's getServerLog:
      * {lines: [{ts, level, text}, …]} — used to seed the panel's log view when
-     * it opens (events stream the live lines afterwards).
+     * it opens (events stream the live lines afterwards). Guarded by the
+     * dedicated log lock, never the instance monitor.
      */
-    public synchronized JsonObject logSnapshot() {
+    public JsonObject logSnapshot() {
         JsonObject o = new JsonObject();
         JsonArray arr = new JsonArray();
-        for (LogLine l : logRing) {
-            JsonObject e = new JsonObject();
-            e.addProperty("ts", l.ts);
-            e.addProperty("level", l.level);
-            e.addProperty("text", l.text);
-            arr.add(e);
+        synchronized (logLock) {
+            for (LogLine l : logRing) {
+                JsonObject e = new JsonObject();
+                e.addProperty("ts", l.ts);
+                e.addProperty("level", l.level);
+                e.addProperty("text", l.text);
+                arr.add(e);
+            }
         }
         o.add("lines", arr);
         return o;
@@ -312,21 +346,22 @@ public final class ServerManager {
         synchronized (this) {
             roomCount = rooms.roomIds().size();
             phoneCount = rooms.totalPhones();
-            JsonObject o = new JsonObject();
-            o.addProperty("status", statusString());
-            o.addProperty("port", port);
-            o.add("addresses", addressesArray());
-            o.addProperty("selectedAddress", selectedAddress);
-            o.addProperty("uptimeMs", status == Status.RUNNING && startedAt > 0
-                    ? System.currentTimeMillis() - startedAt : 0);
-            o.addProperty("rooms", roomCount);
-            o.addProperty("phones", phoneCount);
-            json = gson.toJson(o);
         }
+        Snapshot s = snap;
+        JsonObject o = new JsonObject();
+        o.addProperty("status", statusString(s.status));
+        o.addProperty("port", port);
+        o.add("addresses", addressesArray(s.addresses));
+        o.addProperty("selectedAddress", s.selectedAddress);
+        o.addProperty("uptimeMs", s.status == Status.RUNNING && startedAt > 0
+                ? System.currentTimeMillis() - startedAt : 0);
+        o.addProperty("rooms", roomCount);
+        o.addProperty("phones", phoneCount);
+        json = gson.toJson(o);
         return json;
     }
 
-    private JsonArray addressesArray() {
+    private static JsonArray addressesArray(List<LanAddresses.LanAddress> addresses) {
         JsonArray arr = new JsonArray();
         for (LanAddresses.LanAddress la : addresses) {
             JsonObject e = new JsonObject();
@@ -339,7 +374,7 @@ public final class ServerManager {
         return arr;
     }
 
-    private String statusString() {
+    private static String statusString(Status status) {
         switch (status) {
             case RUNNING:
                 return "running";
@@ -399,7 +434,7 @@ public final class ServerManager {
     /** Appends to the ring buffer (cap 200) and fires onLog. */
     public void log(String level, String text) {
         LogLine line;
-        synchronized (this) {
+        synchronized (logLock) {
             line = new LogLine(System.currentTimeMillis(), level, text);
             logRing.addLast(line);
             while (logRing.size() > LOG_RING_CAPACITY) {
@@ -421,14 +456,21 @@ public final class ServerManager {
 
     private void setStatus(Status next) {
         status = next;
+        publishSnapshot();
         fireStatus();
     }
 
+    /** Publishes the lock-free snapshot (caller holds the instance monitor). */
+    private void publishSnapshot() {
+        snap = new Snapshot(status, new ArrayList<>(addresses), selectedAddress, lastError);
+    }
+
     private void fireStatus() {
-        String statusStr = statusString();
-        List<LanAddresses.LanAddress> snapshot = new ArrayList<>(addresses);
-        String selected = selectedAddress;
-        String error = lastError;
+        Snapshot s = snap;
+        String statusStr = statusString(s.status);
+        List<LanAddresses.LanAddress> snapshot = new ArrayList<>(s.addresses);
+        String selected = s.selectedAddress;
+        String error = s.lastError;
         for (Listener l : listeners) {
             try {
                 l.onStatus(statusStr, port, snapshot, selected, error);
