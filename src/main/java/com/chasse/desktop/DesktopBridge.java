@@ -47,7 +47,7 @@ import javax.swing.SwingUtilities;
  */
 public final class DesktopBridge {
 
-    public static final String VERSION = "1.6.0";
+    public static final String VERSION = "1.6.1";
 
     private final AppConfig config;
     private final ServerManager servers;

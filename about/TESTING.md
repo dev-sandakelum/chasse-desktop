@@ -94,6 +94,9 @@ with `--devtools`.
 - [ ] Custom title bar drag-to-move works; double-click toggles maximized
   state.
 - [ ] `Ctrl+F11` toggles fullscreen; title bar hides in fullscreen.
+- [ ] In fullscreen, `Esc`, `F11` and `Ctrl+F11` each return to the normal window (focus in the page, no phone needed).
+- [ ] In fullscreen, a small "Exit full screen · Esc" pill shows at the top centre for ~3 s, reappears when the pointer touches the top edge, and clicking it leaves fullscreen.
+- [ ] A window maximized with the title-bar button leaves the Windows taskbar visible; fullscreen covers it; leaving fullscreen from a maximized window returns to a maximized window that still leaves the taskbar visible.
 - [ ] Second launch: "Chassé Studio is already running" message appears and the
   second process exits.
 

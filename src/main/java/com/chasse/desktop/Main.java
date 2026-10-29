@@ -8,15 +8,20 @@ import org.cef.CefClient;
 import org.cef.browser.CefBrowser;
 import org.cef.browser.CefFrame;
 import org.cef.handler.CefDisplayHandlerAdapter;
+import org.cef.handler.CefKeyboardHandler;
+import org.cef.handler.CefKeyboardHandlerAdapter;
+import org.cef.misc.BoolRef;
 
 import javax.imageio.ImageIO;
 import javax.swing.BorderFactory;
+import javax.swing.JButton;
 import javax.swing.JFrame;
 import javax.swing.JMenu;
 import javax.swing.JMenuBar;
 import javax.swing.JMenuItem;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
+import javax.swing.JWindow;
 import javax.swing.KeyStroke;
 import javax.swing.SwingUtilities;
 import javax.swing.UIManager;
@@ -31,12 +36,20 @@ import java.awt.FontMetrics;
 import java.awt.Frame;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
+import java.awt.GraphicsConfiguration;
+import java.awt.GraphicsEnvironment;
 import java.awt.Image;
+import java.awt.Insets;
 import java.awt.KeyEventDispatcher;
 import java.awt.KeyboardFocusManager;
+import java.awt.MouseInfo;
 import java.awt.Point;
+import java.awt.PointerInfo;
 import java.awt.Rectangle;
 import java.awt.RenderingHints;
+import java.awt.Toolkit;
+import java.awt.event.ComponentAdapter;
+import java.awt.event.ComponentEvent;
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
@@ -78,9 +91,21 @@ public final class Main {
     private static final Color WIN_BTN_HOVER= new Color(0x35, 0x30, 0x47); // subtle hover
 
     // ── fullscreen state ──────────────────────────────────────────────────────
-    private static boolean   fullscreen         = false;
+    // (read from the CEF key thread too → volatile; everything else runs on the EDT)
+    private static volatile boolean fullscreen  = false;
     private static int       prevExtendedState  = Frame.NORMAL;
     private static Rectangle prevBounds         = null;
+    /** the floating "Exit full screen" pill shown while in fullscreen (EDT only) */
+    private static JWindow           fsHint      = null;
+    private static javax.swing.Timer fsHintTimer = null;
+    /** debounces the keyboard toggle (the Swing dispatcher and the CEF key handler can both see one press) */
+    private static long lastKeyToggleNanos = 0;
+
+    // CEF key event constants (cef_event_flags / Windows virtual-key codes)
+    private static final int CEF_CONTROL_DOWN = 1 << 2;
+    private static final int CEF_ALT_DOWN     = 1 << 3;
+    private static final int VK_ESCAPE        = 27;
+    private static final int VK_F11           = 122;
 
     private Main() {}
 
@@ -328,6 +353,18 @@ public final class Main {
                 frame.setMinimumSize(new Dimension(980, 640));
                 frame.setLocationRelativeTo(null);
 
+                // an undecorated frame maximizes over the WHOLE screen (taskbar
+                // included) unless told its usable area — keep that area right
+                // for whichever monitor the window is on (also after a drag)
+                frame.setMaximizedBounds(workArea(frame.getGraphicsConfiguration()));
+                frame.addComponentListener(new ComponentAdapter() {
+                    @Override public void componentMoved(ComponentEvent e) {
+                        if (fullscreen || frame.getExtendedState() == Frame.MAXIMIZED_BOTH) return;
+                        Rectangle area = workArea(frame.getGraphicsConfiguration());
+                        if (!area.equals(frame.getMaximizedBounds())) frame.setMaximizedBounds(area);
+                    }
+                });
+
                 // custom title bar
                 TitleBar titleBar = new TitleBar(frame, config, browser,
                         () -> shutdown(shutdownStarted, servers, browser, cefApp), startupAssets.badgeLogo);
@@ -344,6 +381,23 @@ public final class Main {
 
                 // Ctrl+F11 fullscreen (webview swallows plain F11)
                 registerF11Toggle(frame, titleBar);
+
+                // keys typed while the WEBVIEW has focus never reach the Swing
+                // dispatcher above — so in fullscreen (title bar hidden) Esc /
+                // F11 / Ctrl+F11 would be dead and the only way out was the phone.
+                // CEF offers every key first: handle the fullscreen ones here.
+                client.addKeyboardHandler(new CefKeyboardHandlerAdapter() {
+                    @Override public boolean onPreKeyEvent(CefBrowser b, CefKeyboardHandler.CefKeyEvent e,
+                                                           BoolRef isKeyboardShortcut) {
+                        if (e.type != CefKeyboardHandler.CefKeyEvent.EventType.KEYEVENT_RAWKEYDOWN) return false;
+                        switch (fullscreenKeyAction(e.windows_key_code, e.modifiers, fullscreen)) {
+                            case EXIT -> SwingUtilities.invokeLater(() -> exitFullscreen(frame, titleBar));
+                            case TOGGLE -> SwingUtilities.invokeLater(() -> keyToggleFullscreen(frame, titleBar));
+                            default -> { return false; }
+                        }
+                        return true; // handled here — the page does not also see the key
+                    }
+                });
 
                 // the webview's Present-mode fullscreen button drives the SAME
                 // window toggle through the bridge (toggleFullscreen)
@@ -518,7 +572,7 @@ public final class Main {
                             if (frame.getExtendedState() == Frame.MAXIMIZED_BOTH)
                                 frame.setExtendedState(Frame.NORMAL);
                             else
-                                frame.setExtendedState(Frame.MAXIMIZED_BOTH);
+                                maximizeKeepingTaskbar(frame);
                         }
                         case CLOSE -> shutdown.run();
                     }
@@ -717,27 +771,145 @@ public final class Main {
         else            enterFullscreen(frame, titleBar);
     }
 
+    /**
+     * The part of a monitor a maximized window may use: the monitor minus the
+     * taskbar / docked bars, in the monitor-relative coordinates that
+     * {@link JFrame#setMaximizedBounds} expects. Pure — unit-tested.
+     */
+    static Rectangle usableArea(Rectangle monitor, Insets insets) {
+        return new Rectangle(insets.left, insets.top,
+                Math.max(1, monitor.width - insets.left - insets.right),
+                Math.max(1, monitor.height - insets.top - insets.bottom));
+    }
+
+    /** {@link #usableArea} of the monitor {@code gc} describes (null → the primary monitor). */
+    static Rectangle workArea(GraphicsConfiguration gc) {
+        if (gc == null) {
+            gc = GraphicsEnvironment.getLocalGraphicsEnvironment().getDefaultScreenDevice().getDefaultConfiguration();
+        }
+        return usableArea(gc.getBounds(), Toolkit.getDefaultToolkit().getScreenInsets(gc));
+    }
+
+    /** Maximize without covering the taskbar (re-measured every time: the
+     *  window may have moved to another monitor or the taskbar may have changed). */
+    private static void maximizeKeepingTaskbar(JFrame frame) {
+        frame.setMaximizedBounds(workArea(frame.getGraphicsConfiguration()));
+        frame.setExtendedState(Frame.MAXIMIZED_BOTH);
+    }
+
+    /** What a key press means for the window's fullscreen state. */
+    enum FsKey { NONE, EXIT, TOGGLE }
+
+    /**
+     * Esc and plain F11 leave fullscreen (and only then — outside fullscreen the
+     * page keeps them), Ctrl+F11 toggles; anything with Alt is left alone.
+     * Pure — unit-tested.
+     */
+    static FsKey fullscreenKeyAction(int windowsKeyCode, int cefModifiers, boolean inFullscreen) {
+        boolean ctrl = (cefModifiers & CEF_CONTROL_DOWN) != 0;
+        boolean alt  = (cefModifiers & CEF_ALT_DOWN) != 0;
+        if (alt) return FsKey.NONE;
+        if (windowsKeyCode == VK_F11 && ctrl) return FsKey.TOGGLE;
+        if (inFullscreen && !ctrl && (windowsKeyCode == VK_ESCAPE || windowsKeyCode == VK_F11)) return FsKey.EXIT;
+        return FsKey.NONE;
+    }
+
+    /** Ctrl+F11 from either key path — ignores the second sight of one key press. */
+    private static void keyToggleFullscreen(JFrame frame, TitleBar titleBar) {
+        long now = System.nanoTime();
+        if (now - lastKeyToggleNanos < 400_000_000L) return;
+        lastKeyToggleNanos = now;
+        toggleFullscreen(frame, titleBar);
+    }
+
+    /**
+     * True fullscreen = the undecorated window sized to the whole monitor (title
+     * bar hidden). Explicit bounds, not MAXIMIZED_BOTH: a maximized window is
+     * confined to the usable area (taskbar visible), which is what the
+     * maximize button is for. No dispose/re-show — that re-parented the
+     * webview and dropped keyboard focus, one reason the exit keys were dead.
+     */
     private static void enterFullscreen(JFrame frame, TitleBar titleBar) {
         if (fullscreen) return;
-        prevExtendedState = frame.getExtendedState();
-        prevBounds = new Rectangle(frame.getX(), frame.getY(), frame.getWidth(), frame.getHeight());
-        titleBar.setBarVisible(false);
-        frame.dispose();
-        frame.setUndecorated(true);
-        frame.setVisible(true);
-        frame.setExtendedState(Frame.MAXIMIZED_BOTH);
+        GraphicsConfiguration gc = frame.getGraphicsConfiguration();
+        Rectangle monitor = (gc != null ? gc
+                : GraphicsEnvironment.getLocalGraphicsEnvironment().getDefaultScreenDevice().getDefaultConfiguration())
+                .getBounds();
+        prevExtendedState = frame.getExtendedState() & Frame.MAXIMIZED_BOTH;
+        prevBounds = frame.getBounds();
         fullscreen = true;
+        titleBar.setBarVisible(false);
+        // leave the maximized state first, or the bounds below are ignored
+        frame.setExtendedState(Frame.NORMAL);
+        frame.setBounds(monitor);
+        frame.toFront();
+        showFullscreenHint(frame, titleBar, monitor);
     }
 
     private static void exitFullscreen(JFrame frame, TitleBar titleBar) {
         if (!fullscreen) return;
-        frame.dispose();
-        frame.setUndecorated(true);   // stay undecorated — we always use the custom bar
-        frame.setVisible(true);
+        fullscreen = false;
+        hideFullscreenHint();
         titleBar.setBarVisible(true);
         if (prevBounds != null) frame.setBounds(prevBounds);
-        frame.setExtendedState(prevExtendedState);
-        fullscreen = false;
+        if (prevExtendedState == Frame.MAXIMIZED_BOTH) maximizeKeepingTaskbar(frame);
+        else frame.setMaximizedBounds(workArea(frame.getGraphicsConfiguration()));
+    }
+
+    /**
+     * The always-reachable way out of fullscreen: a small "Exit full screen"
+     * pill at the top centre. Shown for a few seconds when fullscreen starts and
+     * again whenever the pointer touches the top edge (or rests on the pill);
+     * it is its own top-level window, so it floats above the webview, and not
+     * focusable, so clicking it never steals keyboard focus from the page.
+     */
+    private static void showFullscreenHint(JFrame frame, TitleBar titleBar, Rectangle monitor) {
+        hideFullscreenHint();
+        JWindow w = new JWindow(frame);
+        w.setFocusableWindowState(false);
+        JButton b = new JButton("✕   Exit full screen   ·   Esc");
+        b.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 13));
+        b.setForeground(BAR_FG);
+        b.setBackground(BAR_BG);
+        b.setOpaque(true);
+        b.setFocusable(false);
+        b.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(BADGE_BG, 1),
+                BorderFactory.createEmptyBorder(9, 18, 9, 18)));
+        b.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        b.addMouseListener(new MouseAdapter() {
+            @Override public void mouseEntered(MouseEvent e) { b.setBackground(WIN_BTN_HOVER); }
+            @Override public void mouseExited (MouseEvent e) { b.setBackground(BAR_BG); }
+        });
+        b.addActionListener(ev -> exitFullscreen(frame, titleBar));
+        w.add(b);
+        w.pack();
+        w.setLocation(monitor.x + (monitor.width - w.getWidth()) / 2, monitor.y + 10);
+
+        final long[] hideAt = { System.currentTimeMillis() + 3500 };
+        w.setVisible(true);
+        javax.swing.Timer t = new javax.swing.Timer(120, ev -> {
+            PointerInfo pi = MouseInfo.getPointerInfo();
+            if (pi == null) return;
+            Point p = pi.getLocation();
+            boolean nearTop  = monitor.contains(p) && p.y - monitor.y <= 6;
+            boolean overPill = w.isVisible() && w.getBounds().contains(p);
+            long now = System.currentTimeMillis();
+            if (nearTop || overPill) {
+                hideAt[0] = now + 1500;
+                if (!w.isVisible()) w.setVisible(true);
+            } else if (w.isVisible() && now > hideAt[0]) {
+                w.setVisible(false);
+            }
+        });
+        fsHint = w;
+        fsHintTimer = t;
+        t.start();
+    }
+
+    private static void hideFullscreenHint() {
+        if (fsHintTimer != null) { fsHintTimer.stop(); fsHintTimer = null; }
+        if (fsHint != null)      { fsHint.dispose();  fsHint = null; }
     }
 
     private static void registerF11Toggle(JFrame frame, TitleBar titleBar) {
@@ -748,7 +920,7 @@ public final class Main {
                         && e.getKeyCode() == KeyEvent.VK_F11
                         && (e.getModifiersEx() & KeyEvent.CTRL_DOWN_MASK) != 0
                         && kfm.getActiveWindow() == frame) {
-                    SwingUtilities.invokeLater(() -> toggleFullscreen(frame, titleBar));
+                    SwingUtilities.invokeLater(() -> keyToggleFullscreen(frame, titleBar));
                     e.consume();
                     return true;
                 }

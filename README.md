@@ -21,7 +21,7 @@ This desktop app is the **native shell** for that web app — it gives you:
 | Native window | Custom dark title bar, drag-to-move, minimize / maximize / close |
 | Embedded browser | Chromium via JCEF — the full web app, no browser chrome |
 | Phone remote | LAN sync server lets any phone on the same Wi-Fi control slides |
-| Fullscreen | `Ctrl+F11` — also triggerable from the phone remote |
+| Fullscreen | `Ctrl+F11` — also triggerable from the phone remote. Leave it with `Esc`, `F11`, `Ctrl+F11` or the "Exit full screen" pill that appears at the top of the screen |
 | Offline-capable | Once the web app loads, the remote works without internet |
 
 ---
@@ -202,6 +202,7 @@ The phone remote is a **fully self-contained HTML page** served by the embedded 
 | Shortcut | Action |
 |---|---|
 | `Ctrl+F11` | Toggle fullscreen |
+| `Esc` / `F11` (in fullscreen) | Leave fullscreen |
 
 The phone remote also responds to swipe gestures (left = next, right = prev).
 
