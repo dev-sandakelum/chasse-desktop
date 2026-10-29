@@ -181,6 +181,24 @@ public final class AppConfig {
         return osr;
     }
 
+    /**
+     * The web app's chrome theme as last reported by the page ("dark" /
+     * "light"; null = never reported). The native title bar starts in this
+     * theme so a restart does not flash the other palette before the page
+     * reports again.
+     */
+    public String uiTheme() {
+        return userProperty("ui.theme");
+    }
+
+    /** Remembers the page's theme (best-effort, skipped when unchanged). */
+    public void saveUiTheme(String theme) {
+        if (theme == null || theme.isBlank() || theme.equals(uiTheme())) {
+            return;
+        }
+        saveUserProperty("ui.theme", theme);
+    }
+
     /** Persists {@code app.url} into the user config file (creating directories as needed). */
     public void saveUserAppUrl(String url) {
         this.appUrl = url.trim();

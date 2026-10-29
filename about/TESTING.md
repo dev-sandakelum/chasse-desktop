@@ -41,6 +41,18 @@ clean no-op); `publish` without an origin commits locally and explains;
 
 **Audit result:** 21/21 PASS, `mvn package` BUILD SUCCESS.
 
+### `BarThemeTest` / `WindowAreaTest` — the native window
+
+Pure-logic tests of the title bar and window: both built-in bar palettes
+(the web app's `--ss-*` chrome colours) meet WCAG AA (≥ 4.5:1) for every
+text/surface pair incl. the red close hover; CSS colour parsing of the page's
+`ui.theme` report (`#rgb`, `#rrggbb`, `rgb()`, `rgba()`, space-separated) with
+fallbacks to the built-in palette; resize-edge detection and resize geometry
+(opposite edge fixed, minimum size); maximized usable area (monitor minus
+taskbar insets); which keys leave fullscreen. The Swing bar itself was
+rendered to PNG in both themes through a throwaway harness during
+development — the live webview checks are in the manual list below.
+
 ### Bridge contract smoke test (web repo)
 
 `scripts/test-bridge-contract.mjs` in the web repo drives the real web-side
@@ -87,12 +99,19 @@ with `--devtools`.
 - [ ] First launch downloads ~100 MB of Chromium natives (console shows
   `jcefmaven` progress); subsequent starts skip the download.
 - [ ] If `app.url` is blank, the first-run URL prompt appears.
-- [ ] Window opens: undecorated dark title bar, `</>` badge, "Chassé — slides
-  written as code", File/View/Help menus, minimize/maximize/close buttons.
+- [ ] Window opens: undecorated 32 px title bar — logo, File/View/Help as quiet
+  text, the page title muted in the centre, thin − □ × on the right (close
+  turns red on hover). No wordmark/tagline on the bar.
+- [ ] The bar is the same colour as the web toolbar directly under it — no
+  visible seam — in BOTH themes; toggling the theme inside the web app
+  restyles the bar (and its menus) immediately.
+- [ ] Quit while in the light theme, relaunch: the bar is light from the first
+  frame (no dark flash). `~/.chasse-studio/app.properties` holds `ui.theme`.
 - [ ] Minimum window size (980×640) is enforced — the window cannot be
-  smaller.
-- [ ] Custom title bar drag-to-move works; double-click toggles maximized
-  state.
+  smaller; dragging any edge or corner of the window resizes it (cursor
+  changes on the 4 px rim); no rim while maximized.
+- [ ] Custom title bar drag-to-move works; double-click maximizes / restores
+  (never fullscreen).
 - [ ] `Ctrl+F11` toggles fullscreen; title bar hides in fullscreen.
 - [ ] In fullscreen, `Esc`, `F11` and `Ctrl+F11` each return to the normal window (focus in the page, no phone needed).
 - [ ] In fullscreen, a small "Exit full screen · Esc" pill shows at the top centre for ~3 s, reappears when the pointer touches the top edge, and clicking it leaves fullscreen.

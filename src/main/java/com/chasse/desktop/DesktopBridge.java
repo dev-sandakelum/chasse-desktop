@@ -47,7 +47,7 @@ import javax.swing.SwingUtilities;
  */
 public final class DesktopBridge {
 
-    public static final String VERSION = "1.6.1";
+    public static final String VERSION = "1.7.0";
 
     private final AppConfig config;
     private final ServerManager servers;
@@ -70,6 +70,8 @@ public final class DesktopBridge {
     private volatile DownloadBridge downloads;
     /** window fullscreen toggle (set by Main) — serves the toggleFullscreen action */
     private volatile Runnable fullscreenToggle;
+    /** receives the page's chrome theme reports (set by Main) — serves the ui.theme command */
+    private volatile java.util.function.Consumer<JsonObject> themeListener;
 
     public DesktopBridge(org.cef.CefClient client, AppConfig config, ServerManager servers, SyncRooms rooms) {
         this(client, config, servers, rooms, null);
@@ -110,6 +112,11 @@ public final class DesktopBridge {
      *  embedded webview cannot use the browser Fullscreen API). */
     public void setFullscreenToggle(Runnable toggle) {
         this.fullscreenToggle = toggle;
+    }
+
+    /** Where {@code ui.theme} reports go (the native title bar restyles itself). */
+    public void setThemeListener(java.util.function.Consumer<JsonObject> listener) {
+        this.themeListener = listener;
     }
 
     /* ------------------------------------------------------------------ */
@@ -401,6 +408,27 @@ public final class DesktopBridge {
             }
             o.add("capabilities", caps);
             callback.success(gson.toJson(o));
+            return;
+        }
+        if ("ui.theme".equals(cmd)) {
+            // the page's chrome theme + live toolbar colours → the native title
+            // bar. Only the app may restyle the window; the report is one-way
+            // and carries nothing but colours, so it is answered immediately.
+            if (!isTrusted()) {
+                respondCmdError(callback, FsService.CODE_FORBIDDEN, "this page is not allowed to style the window");
+                return;
+            }
+            java.util.function.Consumer<JsonObject> l = themeListener;
+            if (l != null) {
+                try {
+                    l.accept(req);
+                } catch (RuntimeException ignored) {
+                    // a styling hiccup must never fail the page's request
+                }
+            }
+            JsonObject ok = new JsonObject();
+            ok.addProperty("ok", true);
+            callback.success(gson.toJson(ok));
             return;
         }
         if (cmd.startsWith("fs.") || cmd.startsWith("git.")) {
