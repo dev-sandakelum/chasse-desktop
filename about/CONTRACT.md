@@ -155,6 +155,14 @@ path with `FsService`. File reads are chunked on a worker pool; responses
 include MIME type, Content-Length, ETag, Last-Modified and single-range support.
 Every intercepted request logs path, status, bytes and elapsed milliseconds.
 
+Every response (including 304 and errors) carries
+`Access-Control-Allow-Origin: *`, exactly like the web route `/api/assets`.
+The sandboxed stage runtime is an opaque-origin iframe: plain `<img>` loads
+need no CORS, but the thumbnail capture inside it `fetch()`es the deck's
+images to inline them into the snapshot, which is a CORS read. The header
+exposes nothing new — the virtual path only exists inside the app's own
+window and every path is confined to an allowed deck folder.
+
 HTTP statuses: 200/206 success, 304 unchanged, 403 untrusted origin or unsafe
 path, 404 missing deck/file, 405 unsupported method, 416 invalid range, 500
 unexpected I/O. Error responses include `X-Chasse-Error-Code`: `FORBIDDEN`,

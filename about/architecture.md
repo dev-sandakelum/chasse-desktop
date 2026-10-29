@@ -263,7 +263,11 @@ must match its initiating frame. Java resolves the deck id through the catalog,
 decodes URL segments, and applies the same lexical/canonical confinement rules
 as `FsService`. GET/HEAD responses stream on a worker pool, support byte ranges
 and validators, and log status/bytes/duration. Uploads use bounded bridge chunks
-and atomic temp-file rename. No file listener or port is opened.
+and atomic temp-file rename. No file listener or port is opened. Responses
+carry `Access-Control-Allow-Origin: *` (see CONTRACT.md) so the web app's
+thumbnail capture — a `fetch()` from the opaque-origin stage sandbox — can
+inline deck images into the snapshot; the origin/path confinement above is
+what actually gates access, not the CORS header.
 
 ## How the repos depend on each other
 

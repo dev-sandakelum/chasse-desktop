@@ -263,6 +263,14 @@ public final class AssetRequestHandler extends CefRequestHandlerAdapter {
             responseLength.set((int)Math.min(Integer.MAX_VALUE, len));
             if (p.status != 304) response.setHeaderByName("Content-Length", Long.toString(len), true);
             response.setHeaderByName("X-Content-Type-Options", "nosniff", true);
+            // The sandboxed stage runtime is an OPAQUE-origin iframe: its <img>
+            // loads need no CORS, but the thumbnail capture inside it fetch()es
+            // the same deck images to inline them into the snapshot — a CORS
+            // read. The URL space only exists inside the app's own window and
+            // FsService confines every path to an allowed deck folder, so a
+            // wildcard origin exposes nothing new. The web route (/api/assets)
+            // has sent the same header all along.
+            response.setHeaderByName("Access-Control-Allow-Origin", "*", true);
             if (p.status >= 400) response.setHeaderByName("X-Chasse-Error-Code", p.errorCode, true);
             response.setHeaderByName("Cache-Control", "no-cache", true);
             if (!p.etag.isEmpty() && p.status != 304) response.setHeaderByName("ETag", p.etag, true);

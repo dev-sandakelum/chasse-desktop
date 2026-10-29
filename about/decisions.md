@@ -239,3 +239,56 @@ and the `scanLock` → `lock` ordering. One subtle fix this forced: newest-first
 ordering now uses nanosecond-precision sort keys plus an explicit deck.json
 mtime stamp, because filesystem coarse clocks (~32 ms windows observed) made
 two decks created in the same window compare equal and flipped the order.
+
+## 19. Chromium background services off by default (`Main.DEFAULT_CEF_ARGS`)
+
+**Decision:** the webview always starts with a fixed set of Chromium switches
+(`--disable-background-networking`, `--disable-component-update`,
+`--disable-sync`, `--disable-breakpad`, `--disable-extensions`,
+`--no-pings`, `--metrics-recording-only`, and
+`--disable-features=Translate,OptimizationHints,MediaRouter,InterestFeedContentSuggestions`).
+User `--cef-arg` values are appended AFTER them, so a user flag wins on
+conflict.
+
+**Why:** the app embeds a single, known site. The services those switches
+control (component/extension updaters, sync, crash uploads, translate,
+media-router discovery, optimization-hint downloads) serve a general-purpose
+browser, not this app; each one costs threads, memory and start-up network
+traffic inside the user's desktop window. None of them is needed for the
+bridge, the asset interception, downloads or the phone remote.
+
+## 20. Packaged JVM runs Serial GC + C1 only, 48 MB initial heap
+
+**Decision:** every packager (`package-windows.ps1`, `package-linux.sh`,
+`package-macos.sh`) now passes `-Xms48m -Xmx512m -XX:+UseSerialGC
+-XX:TieredStopAtLevel=1 -XX:+ExitOnOutOfMemoryError` instead of only
+`-Xmx512m`.
+
+**Why:** the Java side does file IO, JSON and a small WebSocket server — no
+sustained CPU work. G1 keeps remembered sets and concurrent-marking threads
+that are pure overhead on a 512 MB heap; Serial has the smallest footprint
+and its pauses on this heap size are a few milliseconds. C1-only (`Tiered
+StopAtLevel=1`) removes the C2 compiler threads and their code cache growth
+(start-up is faster, steady-state memory lower; peak throughput is irrelevant
+here). `ExitOnOutOfMemoryError` turns a wedged half-dead process into a clean
+exit the user can restart — the Chromium renderer processes live outside
+the JVM heap and are unaffected. Nothing in the dev build (`mvn exec`) is
+changed; these are installer-only options.
+
+## 21. Thumbnails are rasterised by the web app, not by Java
+
+**Decision:** slide thumbnails (filmstrip, library covers, Present overview)
+are WebP snapshots captured INSIDE the web app's own sandboxed stage runtime
+and cached in the browser profile's IndexedDB (persistent since decision 1).
+Java's only part is the CORS header on asset responses (CONTRACT.md "Same-origin
+asset interception"). No new bridge command, no `~/.chasse-studio/thumbs`
+folder, no `.stagesmith/` cache written into deck folders.
+
+**Why:** the web app already renders slides exactly; a Java-side renderer
+would duplicate the stage runtime (or need a second headless Chromium) and
+would not work for the hosted web mode at all. Keeping the cache in the
+browser profile means web mode and desktop mode share one implementation,
+older desktop builds work with the newer web app unchanged (only the CORS
+header improves fidelity of image backgrounds in captures — without it the
+capture still succeeds, the image layer is just missing from the snapshot),
+and nothing is written next to the user's files.

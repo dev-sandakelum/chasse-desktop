@@ -43,6 +43,6 @@ jpackage \
   --app-version "$VERSION" \
   --vendor "Chasse Studio" \
   --description "Chasse Studio desktop app with phone remote" \
-  --java-options "-Xmx512m"
+  --java-options "-Xms48m" \n  --java-options "-Xmx512m" \n  --java-options "-XX:+UseSerialGC" \n  --java-options "-XX:TieredStopAtLevel=1" \n  --java-options "-XX:+ExitOnOutOfMemoryError"
 
 echo "Done: target/installer/"

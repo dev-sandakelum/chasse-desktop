@@ -52,7 +52,11 @@ jpackage \
   --app-version "$VERSION" \
   --vendor "Chasse Studio" \
   --description "Chasse Studio desktop app with phone remote" \
+  --java-options "-Xms48m" \
   --java-options "-Xmx512m" \
+  --java-options "-XX:+UseSerialGC" \
+  --java-options "-XX:TieredStopAtLevel=1" \
+  --java-options "-XX:+ExitOnOutOfMemoryError" \
   --mac-package-name "Chasse Studio"
 
 echo "Done: target/installer/ChasseStudio-${VERSION}.dmg"

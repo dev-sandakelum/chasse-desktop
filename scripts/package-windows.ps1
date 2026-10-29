@@ -74,7 +74,11 @@ Write-Host "Running jpackage..." -ForegroundColor Cyan
   --app-version     $VERSION `
   --vendor          "Chasse Studio" `
   --description     "Chasse Studio desktop app with phone remote" `
+  --java-options    "-Xms48m" `
   --java-options    "-Xmx512m" `
+  --java-options    "-XX:+UseSerialGC" `
+  --java-options    "-XX:TieredStopAtLevel=1" `
+  --java-options    "-XX:+ExitOnOutOfMemoryError" `
   --icon            src\main\resources\Logo.ico
 
 if ($LASTEXITCODE -ne 0) {

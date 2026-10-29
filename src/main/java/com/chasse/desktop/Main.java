@@ -175,6 +175,18 @@ public final class Main {
         }
     }
 
+    /** Chromium switches applied before any user-supplied {@code --cef-arg}. */
+    static final String[] DEFAULT_CEF_ARGS = {
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-sync",
+            "--disable-breakpad",
+            "--disable-extensions",
+            "--no-pings",
+            "--metrics-recording-only",
+            "--disable-features=Translate,OptimizationHints,MediaRouter,InterestFeedContentSuggestions",
+    };
+
     private static void runGui(AppConfig config) {
         AtomicReference<JFrame> frameRef       = new AtomicReference<>();
         AtomicBoolean           shutdownStarted = new AtomicBoolean(false);
@@ -205,6 +217,13 @@ public final class Main {
             builder.setInstallDir(new File(System.getProperty("user.home"), ".chasse-studio/jcef-bundle"));
             builder.setProgressHandler(new ConsoleProgressHandler());
             builder.getCefSettings().windowless_rendering_enabled = config.osr();
+            // Embedded single-site browser: switch off the background services a
+            // general-purpose Chrome runs (component/extension updates, sync,
+            // metrics uploads, crash reporter, translate, speculative
+            // preconnects). None of them serve the app; each costs threads,
+            // memory and start-up network traffic. User --cef-arg values are
+            // appended AFTER these, so they win on conflict.
+            builder.addJcefArgs(DEFAULT_CEF_ARGS);
             if (!config.cefArgs().isEmpty())
                 builder.addJcefArgs(config.cefArgs().toArray(new String[0]));
             if (config.devtoolsPort() > 0)
