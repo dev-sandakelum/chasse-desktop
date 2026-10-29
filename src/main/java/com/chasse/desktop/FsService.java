@@ -492,6 +492,12 @@ public final class FsService {
         }
     }
 
+    /** The confined deck folder for a sibling service ({@link GitService}) —
+     *  the same id/catalog/existence checks as every fs command. */
+    Path deckDir(String deck) throws FsException {
+        return requireDeckDir(deck);
+    }
+
     /** Same-folder validation used by the HTTP read path (deck must exist). */
     Path resolveHttpReadTarget(String deck, String rel) throws FsException {
         Path dir = requireDeckDir(deck);
@@ -1298,7 +1304,11 @@ public final class FsService {
         }
         List<Path> files;
         try (Stream<Path> walk = Files.walk(src)) {
-            files = walk.filter(Files::isRegularFile).collect(java.util.stream.Collectors.toList());
+            // a .git inside the deck is NOT copied: the copy is a plain deck,
+            // not a second checkout sharing the original's history and remote
+            files = walk.filter(Files::isRegularFile)
+                    .filter(f -> !".git".equals(src.relativize(f).getName(0).toString()))
+                    .collect(java.util.stream.Collectors.toList());
         } catch (IOException e) {
             throw ioOf(e, "scan " + deck);
         }
@@ -1599,7 +1609,7 @@ public final class FsService {
                 fileList, WorkerPools.IO_THREADS, WorkerPools.NEVER_CANCELLED,
                 p -> {
                     try {
-                        Files.delete(p);
+                        deleteFile(p);
                     } catch (IOException e) {
                         failures.add(p.getFileName() + ": " + reasonOf(e));
                     }
@@ -1626,6 +1636,30 @@ public final class FsService {
         return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
     }
 
+    /**
+     * {@code Files.delete} that also removes a READ-ONLY file. Git marks
+     * every object and pack file read-only on Windows, so deleting a deck
+     * folder with a {@code .git} inside used to stop halfway with
+     * NO_OS_PERMISSION. A genuinely locked/open file still fails as before.
+     */
+    private static void deleteFile(Path p) throws IOException {
+        try {
+            Files.delete(p);
+        } catch (AccessDeniedException denied) {
+            java.nio.file.attribute.DosFileAttributeView dos = Files.getFileAttributeView(
+                    p, java.nio.file.attribute.DosFileAttributeView.class, LinkOption.NOFOLLOW_LINKS);
+            if (dos == null) {
+                throw denied;
+            }
+            try {
+                dos.setReadOnly(false);
+            } catch (IOException e) {
+                throw denied;
+            }
+            Files.delete(p);
+        }
+    }
+
     private static void deleteTreeBestEffort(Path dir) {
         try (Stream<Path> walk = Files.walk(dir)) {
             List<Path> order = walk.sorted(Comparator.reverseOrder())
@@ -1647,7 +1681,7 @@ public final class FsService {
                     fileList, WorkerPools.IO_THREADS, WorkerPools.NEVER_CANCELLED,
                     p -> {
                         try {
-                            Files.delete(p);
+                            deleteFile(p);
                         } catch (IOException ignored) {
                             // best effort — a partial failure just leaves files to retry
                         }

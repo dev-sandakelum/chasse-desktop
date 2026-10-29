@@ -294,6 +294,39 @@ class FsServiceTest {
     }
 
     @Test
+    void deleteRemovesReadOnlyGitObjectsToo() throws Exception {
+        // git marks objects/pack files read-only (on Windows an AccessDenied
+        // on delete) — a connected deck must still delete completely
+        fs.createDeck("repo", deckFiles("repo", "Repo"));
+        Path object = tempDir.resolve("decks/repo/.git/objects/ab/cdef");
+        Files.createDirectories(object.getParent());
+        Files.writeString(object, "blob");
+        java.nio.file.attribute.DosFileAttributeView dos = Files.getFileAttributeView(
+                object, java.nio.file.attribute.DosFileAttributeView.class);
+        if (dos != null) {
+            dos.setReadOnly(true);
+        }
+        JsonObject res = fs.deleteDeck("repo");
+        assertTrue(res.get("ok").getAsBoolean());
+        assertFalse(Files.exists(tempDir.resolve("decks/repo")));
+    }
+
+    @Test
+    void duplicateDoesNotCopyTheGitFolder() throws Exception {
+        fs.createDeck("orig", deckFiles("orig", "Original"));
+        fs.writeText("orig", "slides/s1.tsx", "// slide");
+        Path git = tempDir.resolve("decks/orig/.git");
+        Files.createDirectories(git.resolve("refs/heads"));
+        Files.writeString(git.resolve("HEAD"), "ref: refs/heads/main\n");
+        Files.writeString(git.resolve("config"), "[core]\n");
+        JsonObject res = fs.duplicateDeck("orig", "copy", "Copy");
+        assertTrue(res.get("ok").getAsBoolean());
+        assertEquals("// slide", fs.readText("copy", "slides/s1.tsx").get("text").getAsString());
+        assertFalse(Files.exists(tempDir.resolve("decks/copy/.git")), "the copy must be a plain deck, not a second checkout");
+        assertTrue(Files.exists(git.resolve("HEAD")), "the original repository is untouched");
+    }
+
+    @Test
     void removeFromLibraryKeepsDeckFilesAndPreventsAutomaticReadoption() throws Exception {
         fs.createDeck("kept", deckFiles("Kept"));
         Path deckDir = tempDir.resolve("decks/kept");

@@ -26,6 +26,18 @@ mvn clean package   # tests run as part of the package phase
 | Error codes | `FOLDER_NOT_SET`, `FOLDER_MISSING`, `ALREADY_EXISTS`, `NOT_FOUND`, `BAD_REQUEST` |
 | Scan correctness | `listDecks` returns only folders that contain `deck.json` matching the deck-id pattern |
 | Hidden snapshot files | `.stagesmith/snapshots/` contents are not mistaken for decks |
+| `.git` inside a deck | `deleteDeck` removes read-only git object files; `duplicateDeck` never copies `.git` |
+
+### `GitServiceTest` — the `git` capability (needs git on PATH, skipped otherwise)
+
+Runs against a real git on real disk: a deck folder initialised as a
+repository plus a bare `origin.git` in the temp dir. Covers: plain deck →
+`{connected:false, reason:"no-repo"}`; repository on `main` → connected, dirty
+until committed, dirty again after a new file; another branch / detached HEAD
+→ not connected; the generated commit message format; `publish` commits and
+pushes to origin (remote has the commit, upstream set, second publish is a
+clean no-op); `publish` without an origin commits locally and explains;
+`publish` on a plain deck → `NOT_CONNECTED` and never creates a repository.
 
 **Audit result:** 21/21 PASS, `mvn package` BUILD SUCCESS.
 

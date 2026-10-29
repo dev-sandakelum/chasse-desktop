@@ -25,9 +25,9 @@ import javax.swing.SwingUtilities;
  *   <li>v1 (sync): request {@code {id, action, payload}}, response
  *       {@code {"id":..,"ok":true,"data":{..}}} or
  *       {@code {"id":..,"ok":false,"error":".."}}</li>
- *   <li>v2 (hello + fs, the "fs" capability): request {@code {cmd, ...params}}
- *       answered with the raw contract shapes — e.g.
- *       {@code {cmd:"hello"}} → {@code {app, version, capabilities:["sync","fs"]}},
+ *   <li>v2 (hello + fs + git, the "fs" and "git" capabilities): request
+ *       {@code {cmd, ...params}} answered with the raw contract shapes — e.g.
+ *       {@code {cmd:"hello"}} → {@code {app, version, capabilities:["sync","fs",…,"git"]}},
  *       {@code fs.listDecks} → {@code [{id,title,folder,slides,modified}]}, and
  *       every failure as {@code {code, message}} with codes like
  *       FOLDER_NOT_SET / FOLDER_MISSING / NO_OS_PERMISSION / NOT_FOUND /
@@ -47,12 +47,14 @@ import javax.swing.SwingUtilities;
  */
 public final class DesktopBridge {
 
-    public static final String VERSION = "1.5.0";
+    public static final String VERSION = "1.6.0";
 
     private final AppConfig config;
     private final ServerManager servers;
     private final SyncRooms rooms;
     private final FsService fs;
+    /** the "git" capability — present exactly when fs is */
+    private final GitService git;
     private final Gson gson = new Gson();
     // All worker threads live in the shared WorkerPools infrastructure:
     // named daemon threads, bounded queues, clean JVM shutdown. The old
@@ -79,6 +81,7 @@ public final class DesktopBridge {
         this.servers = servers;
         this.rooms = rooms;
         this.fs = fs;
+        this.git = fs == null ? null : new GitService(fs);
 
         CefMessageRouter router = CefMessageRouter.create(); // default: window.cefQuery
         router.addHandler(new QueryHandler(), false);
@@ -393,11 +396,14 @@ public final class DesktopBridge {
             caps.add("fs");
             caps.add("downloads");
             caps.add("assetUrls");
+            if (git != null) {
+                caps.add("git");
+            }
             o.add("capabilities", caps);
             callback.success(gson.toJson(o));
             return;
         }
-        if (cmd.startsWith("fs.")) {
+        if (cmd.startsWith("fs.") || cmd.startsWith("git.")) {
             if (fs == null) {
                 respondCmdError(callback, FsService.CODE_IO_ERROR, "fs commands are not available");
                 return;
@@ -411,7 +417,7 @@ public final class DesktopBridge {
             try {
                 WorkerPools.fsExecute(() -> {
                     try {
-                        JsonElement data = dispatchFs(cmd, req);
+                        JsonElement data = cmd.startsWith("git.") ? dispatchGit(cmd, req) : dispatchFs(cmd, req);
                         callback.success(data == null ? "{}" : gson.toJson(data));
                     } catch (FsService.FsException e) {
                         respondCmdError(callback, e.code, e.getMessage());
@@ -508,6 +514,24 @@ public final class DesktopBridge {
             }
             case "fs.delete" -> {
                 return fs.delete(requireParam(req, "deck"), requireParam(req, "path"));
+            }
+            default -> throw new FsService.FsException(FsService.CODE_UNKNOWN_CMD, "unknown command: " + cmd);
+        }
+    }
+
+    /**
+     * The git commands — same trust gate and worker as the fs commands (the
+     * deck folder is resolved by FsService; git runs in that folder only).
+     * {@code git.publish} takes nothing but the deck: the commit message is
+     * generated on this side.
+     */
+    private JsonElement dispatchGit(String cmd, JsonObject req) throws FsService.FsException {
+        switch (cmd) {
+            case "git.status" -> {
+                return git.status(requireParam(req, "deck"));
+            }
+            case "git.publish" -> {
+                return git.publish(requireParam(req, "deck"));
             }
             default -> throw new FsService.FsException(FsService.CODE_UNKNOWN_CMD, "unknown command: " + cmd);
         }

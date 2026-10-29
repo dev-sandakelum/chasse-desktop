@@ -6,7 +6,7 @@
 
   <groupId>com.chasse</groupId>
   <artifactId>chasse-studio-desktop</artifactId>
-  <version>1.5.1</version>
+  <version>1.6.0</version>
   <packaging>jar</packaging>
 
   <name>Chasse Studio Desktop</name>

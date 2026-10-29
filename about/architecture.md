@@ -104,6 +104,8 @@ failure.
 | `fs.delete` | `{deck, path}` | `{ok:true}` — file or folder, verified gone |
 | `assetUrls` hello capability | — | Enables `/__chasse_files__/<deck>/<path>` interception |
 | `fs.beginAssetUpload` / `fs.writeAssetChunk` / `fs.finishAssetUpload` | upload path + bounded chunks | streamed temp file + atomic rename |
+| `git.status` (`git` capability, `GitService`) | `{deck}` | `{connected:true, branch:"main", dirty}` or `{connected:false, reason}` — only a deck folder that is itself a repository on `main` counts |
+| `git.publish` | `{deck}` | `{ok, committed, commit?, error?}` — add -A · commit `"chasse: update <date time>"` (message generated here) · push -u origin main; fixed argv, no shell, no prompts, no console window |
 
 **Error codes** (v2 failures, HTTP layer uses the same codes):
 `FOLDER_NOT_SET`, `FOLDER_MISSING`, `NO_OS_PERMISSION`, `NOT_FOUND`,
