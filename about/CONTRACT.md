@@ -87,7 +87,7 @@ app origin and return `{code: "FORBIDDEN", message: "…"}` otherwise.
 
 | Command | Params | Success shape | Notes |
 |---|---|---|---|
-| `hello` | — | `{app: "chasse-desktop", version: "1.7.0", capabilities: ["sync","fs","downloads","assetUrls","git"]}` | Available to untrusted pages |
+| `hello` | — | `{app: "chasse-desktop", version: "1.7.1", capabilities: ["sync","fs","downloads","assetUrls","git"]}` | Available to untrusted pages |
 | `fs.getRoot` | — | `{configured: bool, path: string, valid: bool}` | Never throws; it is the health report |
 | `fs.chooseRoot` | `{title?, startPath?, hint?}` | `{cancelled: true}` OR `{configured, path, valid}` | Cancel is a clean answer, not an error; shows native folder chooser on Swing EDT |
 | `fs.listDecks` | — | `[{id, title, folder, slides, modified}]` | Sorted by modified descending |

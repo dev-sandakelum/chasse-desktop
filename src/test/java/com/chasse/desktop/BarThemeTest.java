@@ -41,6 +41,59 @@ class BarThemeTest {
     }
 
     @Test
+    void menuDropdownColoursMeetAA() {
+        for (BarTheme t : new BarTheme[]{BarTheme.DARK, BarTheme.LIGHT}) {
+            assertTrue(BarTheme.contrast(t.ink2, t.pop) >= AA, "resting menu item on popup");
+            assertTrue(BarTheme.contrast(t.ink, t.accSoft) >= AA, "hovered menu item on accent-soft");
+            assertTrue(BarTheme.contrast(t.mut, t.pop) >= AA, "accelerator on popup");
+            // the hover is a tint, not a block: visibly different from the popup but still the popup's family
+            assertTrue(BarTheme.contrast(t.accSoft, t.pop) < 2.0, "hover is a soft tint");
+            assertNotEquals(t.pop, t.accSoft);
+            assertNotEquals(t.line, t.lineStrong);
+        }
+    }
+
+    @Test
+    void accentSoftIsTheWebTintCompositedOverThePopup() {
+        // stagesmith.css: --ss-acc-soft is rgba(255,180,84,.14) on dark, rgba(199,90,0,.11) on light
+        assertEquals(BarTheme.over(new Color(255, 180, 84, 36), BarTheme.DARK.pop), BarTheme.DARK.accSoft);
+        assertEquals(BarTheme.over(new Color(199, 90, 0, 28), BarTheme.LIGHT.pop), BarTheme.LIGHT.accSoft);
+        assertEquals(new Color(0x3b3650), BarTheme.DARK.lineStrong);
+        assertEquals(new Color(0xc4c0d6), BarTheme.LIGHT.lineStrong);
+        // compositing: fully opaque wins, fully transparent is the backdrop, half is the midpoint
+        assertEquals(Color.RED, BarTheme.over(new Color(255, 0, 0, 255), Color.BLUE));
+        assertEquals(Color.BLUE, BarTheme.over(new Color(255, 0, 0, 0), Color.BLUE));
+        assertEquals(new Color(51, 0, 204), BarTheme.over(new Color(255, 0, 0, 51), new Color(0, 0, 255)));
+    }
+
+    @Test
+    void parsesAlphaWhenAskedTo() {
+        assertEquals(new Color(255, 180, 84, 36), BarTheme.parseCssRgba("rgba(255, 180, 84, 0.14)"));
+        assertEquals(new Color(26, 23, 35, 128), BarTheme.parseCssRgba("rgb(26 23 35 / 50%)"));
+        assertEquals(new Color(0x1a, 0x17, 0x23, 0x80), BarTheme.parseCssRgba("#1a172380"));
+        assertEquals(255, BarTheme.parseCssRgba("#1a1723").getAlpha());
+        assertEquals(255, BarTheme.parseCssRgba("rgb(1, 2, 3)").getAlpha());
+        assertEquals(255, BarTheme.parseCssRgba("rgba(1, 2, 3, 7)").getAlpha(), "alpha clamps to 1");
+        assertNull(BarTheme.parseCssRgba("rgba(1, 2, 3, x)"));
+    }
+
+    @Test
+    void pageReportCompositesAccentSoftOverThePagePopupColour() {
+        JsonObject o = new JsonObject();
+        o.addProperty("theme", "dark");
+        o.addProperty("pop", "#000000");
+        o.addProperty("accSoft", "rgba(255, 255, 255, 0.5)");
+        o.addProperty("lineStrong", "#808080");
+        BarTheme t = BarTheme.fromPage(o);
+        assertEquals(new Color(128, 128, 128), t.accSoft);
+        assertEquals(new Color(0x808080), t.lineStrong);
+        // missing → built-in of the same theme
+        BarTheme d = BarTheme.fromPage(new JsonObject());
+        assertEquals(BarTheme.DARK.accSoft, d.accSoft);
+        assertEquals(BarTheme.DARK.lineStrong, d.lineStrong);
+    }
+
+    @Test
     void closeHoverGlyphMeetsAA() {
         assertTrue(BarTheme.contrast(Color.WHITE, new Color(0xc4, 0x2b, 0x1c)) >= AA);
     }

@@ -105,6 +105,13 @@ with `--devtools`.
 - [ ] The bar is the same colour as the web toolbar directly under it — no
   visible seam — in BOTH themes; toggling the theme inside the web app
   restyles the bar (and its menus) immediately.
+- [ ] Open *File*: the dropdown is a dark (or light) rounded panel with a
+  1 px edge and a soft shadow over the page — no white bands above or below
+  the items, a single thin separator above *Exit*, an amber-tinted rounded
+  hover on items (also when moving with the arrow keys), *Ctrl+F11* muted at
+  the right of *View → Toggle Fullscreen*. Sliding the mouse to *View* /
+  *Help* switches menus; clicking the bar or the page closes the menu. The
+  bar itself does not move or re-layout when a menu opens.
 - [ ] Quit while in the light theme, relaunch: the bar is light from the first
   frame (no dark flash). `~/.chasse-studio/app.properties` holds `ui.theme`.
 - [ ] Minimum window size (980×640) is enforced — the window cannot be
