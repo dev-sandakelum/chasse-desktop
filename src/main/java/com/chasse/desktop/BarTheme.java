@@ -45,19 +45,43 @@ final class BarTheme {
      * {@link #pop} (the bar never paints translucent colours).
      */
     final Color accSoft;
+    /** the page background ({@code --ss-bg}) — dialog input fields */
+    final Color bg;
+    /** the accent ({@code --ss-acc}) — primary dialog buttons, focus rings */
+    final Color acc;
+    /** text on the accent ({@code --ss-acc-ink}) */
+    final Color accInk;
+    /** hovered button edge ({@code --ss-hovline}) */
+    final Color hovline;
+    /** destructive actions ({@code --ss-danger}) */
+    final Color danger;
 
     static final BarTheme DARK = new BarTheme(false,
             new Color(0x1a1723), new Color(0x211e2d), new Color(0x211e2d), new Color(0x2e2a3c), new Color(0x3b3650),
             new Color(0xefeaf7), new Color(0xd9d2e8), new Color(0x9189a6),
-            over(new Color(255, 180, 84, 36), new Color(0x211e2d)));   // rgba(255,180,84,.14)
+            over(new Color(255, 180, 84, 36), new Color(0x211e2d)),   // rgba(255,180,84,.14)
+            new Color(0x12101a), new Color(0xffb454), new Color(0x2a1700), new Color(0x4a4362), new Color(0xff7a90));
 
     static final BarTheme LIGHT = new BarTheme(true,
             new Color(0xf7f6fb), new Color(0xffffff), new Color(0xffffff), new Color(0xd8d5e4), new Color(0xc4c0d6),
             new Color(0x1c1930), new Color(0x332d47), new Color(0x625c7a),
-            over(new Color(199, 90, 0, 28), new Color(0xffffff)));     // rgba(199,90,0,.11)
+            over(new Color(199, 90, 0, 28), new Color(0xffffff)),     // rgba(199,90,0,.11)
+            new Color(0xe9e7f0), new Color(0xc75a00), new Color(0xffffff), new Color(0xb6b1c9), new Color(0xc8324f));
 
+    /** The bar palette only — the dialog colours fall back to the built-in theme of the same kind. */
     BarTheme(boolean light, Color panel, Color panel2, Color pop, Color line, Color lineStrong,
              Color ink, Color ink2, Color mut, Color accSoft) {
+        this(light, panel, panel2, pop, line, lineStrong, ink, ink2, mut, accSoft,
+                light ? new Color(0xe9e7f0) : new Color(0x12101a),
+                light ? new Color(0xc75a00) : new Color(0xffb454),
+                light ? new Color(0xffffff) : new Color(0x2a1700),
+                light ? new Color(0xb6b1c9) : new Color(0x4a4362),
+                light ? new Color(0xc8324f) : new Color(0xff7a90));
+    }
+
+    BarTheme(boolean light, Color panel, Color panel2, Color pop, Color line, Color lineStrong,
+             Color ink, Color ink2, Color mut, Color accSoft,
+             Color bg, Color acc, Color accInk, Color hovline, Color danger) {
         this.light = light;
         this.panel = panel;
         this.panel2 = panel2;
@@ -68,6 +92,11 @@ final class BarTheme {
         this.ink2 = ink2;
         this.mut = mut;
         this.accSoft = accSoft;
+        this.bg = bg;
+        this.acc = acc;
+        this.accInk = accInk;
+        this.hovline = hovline;
+        this.danger = danger;
     }
 
     /** "light" → {@link #LIGHT}, anything else → {@link #DARK} (the web app's own default). */
@@ -81,7 +110,8 @@ final class BarTheme {
 
     /**
      * The page's report: {@code {theme:"dark"|"light", panel, panel2, pop,
-     * line, lineStrong, ink, ink2, mut, accSoft}} where every colour is a CSS
+     * line, lineStrong, ink, ink2, mut, accSoft, bg, acc, accInk, hovline,
+     * danger}} where every colour is a CSS
      * colour string as {@code getComputedStyle} returned it (may be
      * empty/missing). {@code accSoft} may carry an alpha — it is composited
      * over the resolved popup colour.
@@ -99,7 +129,12 @@ final class BarTheme {
                 pick(o, "ink", base.ink),
                 pick(o, "ink2", base.ink2),
                 pick(o, "mut", base.mut),
-                accSoft == null ? base.accSoft : over(accSoft, pop));
+                accSoft == null ? base.accSoft : over(accSoft, pop),
+                pick(o, "bg", base.bg),
+                pick(o, "acc", base.acc),
+                pick(o, "accInk", base.accInk),
+                pick(o, "hovline", base.hovline),
+                pick(o, "danger", base.danger));
     }
 
     private static String str(JsonObject o, String key) {

@@ -78,6 +78,38 @@ class BarThemeTest {
     }
 
     @Test
+    void builtInDialogColoursAreTheWebAccentPalette() {
+        // stagesmith.css: --ss-bg, --ss-acc, --ss-acc-ink, --ss-hovline, --ss-danger per theme
+        assertEquals(new Color(0x12101a), BarTheme.DARK.bg);
+        assertEquals(new Color(0xffb454), BarTheme.DARK.acc);
+        assertEquals(new Color(0x2a1700), BarTheme.DARK.accInk);
+        assertEquals(new Color(0x4a4362), BarTheme.DARK.hovline);
+        assertEquals(new Color(0xff7a90), BarTheme.DARK.danger);
+        assertEquals(new Color(0xe9e7f0), BarTheme.LIGHT.bg);
+        assertEquals(new Color(0xc75a00), BarTheme.LIGHT.acc);
+        assertEquals(Color.WHITE, BarTheme.LIGHT.accInk);
+        // the bar-only constructor fills them in from the built-in theme of the same kind
+        BarTheme d = BarTheme.DARK;
+        BarTheme barOnly = new BarTheme(false, d.panel, d.panel2, d.pop, d.line, d.lineStrong, d.ink, d.ink2, d.mut, d.accSoft);
+        assertEquals(d.acc, barOnly.acc);
+        assertEquals(d.danger, barOnly.danger);
+    }
+
+    @Test
+    void pageReportCarriesTheDialogColoursToo() {
+        JsonObject o = new JsonObject();
+        o.addProperty("theme", "light");
+        o.addProperty("acc", "rgb(10, 20, 30)");
+        o.addProperty("danger", "#ff0000");
+        o.addProperty("bg", "not a colour");
+        BarTheme t = BarTheme.fromPage(o);
+        assertEquals(new Color(10, 20, 30), t.acc);
+        assertEquals(Color.RED, t.danger);
+        assertEquals(BarTheme.LIGHT.bg, t.bg, "unparsable → built-in of the same theme");
+        assertEquals(BarTheme.LIGHT.accInk, t.accInk, "missing → built-in of the same theme");
+    }
+
+    @Test
     void pageReportCompositesAccentSoftOverThePagePopupColour() {
         JsonObject o = new JsonObject();
         o.addProperty("theme", "dark");

@@ -18,7 +18,7 @@ This desktop app is the **native shell** for that web app — it gives you:
 
 | Feature | Details |
 |---|---|
-| Native window | Custom dark title bar, drag-to-move, minimize / maximize / close |
+| Native window | Undecorated window in the web app's own light/dark chrome — rounded corners and a themed 1 px border on Windows 11 (DWM), a 32 px title bar with File / View / Help, drag-to-move, minimize / maximize / close, and themed dialogs instead of stock Swing ones |
 | Embedded browser | Chromium via JCEF — the full web app, no browser chrome |
 | Phone remote | LAN sync server lets any phone on the same Wi-Fi control slides |
 | Fullscreen | `Ctrl+F11` — also triggerable from the phone remote. Leave it with `Esc`, `F11`, `Ctrl+F11` or the "Exit full screen" pill that appears at the top of the screen |
@@ -221,7 +221,7 @@ The phone remote also responds to swipe gestures (left = next, right = prev).
 | Layer | Technology |
 |---|---|
 | Language | Java 17 |
-| GUI | Swing (undecorated, fully custom title bar) |
+| GUI | Swing (undecorated; custom title bar, dialogs and outline — JNA for the Windows 11 DWM window attributes) |
 | Browser engine | JCEF (Java Chromium Embedded Framework) via jcefmaven |
 | HTTP + WebSocket server | Javalin 6 |
 | JSON | Gson |

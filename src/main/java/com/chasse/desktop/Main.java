@@ -14,18 +14,13 @@ import org.cef.handler.CefLoadHandlerAdapter;
 import org.cef.misc.BoolRef;
 
 import javax.imageio.ImageIO;
-import javax.swing.BorderFactory;
-import javax.swing.JButton;
 import javax.swing.JFrame;
-import javax.swing.JOptionPane;
 import javax.swing.JWindow;
 import javax.swing.SwingUtilities;
 import javax.swing.UIManager;
 import javax.swing.WindowConstants;
 import java.awt.BorderLayout;
-import java.awt.Cursor;
 import java.awt.Dimension;
-import java.awt.Font;
 import java.awt.Frame;
 import java.awt.GraphicsConfiguration;
 import java.awt.GraphicsEnvironment;
@@ -41,8 +36,6 @@ import java.awt.Toolkit;
 import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
 import java.awt.event.KeyEvent;
-import java.awt.event.MouseAdapter;
-import java.awt.event.MouseEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.io.File;
@@ -89,7 +82,8 @@ public final class Main {
             + "var t=d.dataset.ssTheme==='light'?'light':'dark';"
             + "var r={cmd:'ui.theme',theme:t,panel:v('--ss-panel'),panel2:v('--ss-panel2'),pop:v('--ss-pop'),"
             + "line:v('--ss-line'),lineStrong:v('--ss-line-strong'),ink:v('--ss-ink'),ink2:v('--ss-ink2'),"
-            + "mut:v('--ss-mut'),accSoft:v('--ss-acc-soft')};"
+            + "mut:v('--ss-mut'),accSoft:v('--ss-acc-soft'),bg:v('--ss-bg'),acc:v('--ss-acc'),"
+            + "accInk:v('--ss-acc-ink'),hovline:v('--ss-hovline'),danger:v('--ss-danger')};"
             + "if(typeof window.cefQuery==='function')window.cefQuery({request:JSON.stringify(r),persistent:false,"
             + "onSuccess:function(){},onFailure:function(){}});"
             + "}catch(e){}}"
@@ -107,6 +101,8 @@ public final class Main {
     private static javax.swing.Timer fsHintTimer = null;
     /** debounces the keyboard toggle (the Swing dispatcher and the CEF key handler can both see one press) */
     private static long lastKeyToggleNanos = 0;
+    /** the theme the bar currently wears — the dialogs and the window outline follow it */
+    private static final AtomicReference<BarTheme> currentTheme = new AtomicReference<>(BarTheme.DARK);
 
     // CEF key event constants (cef_event_flags / Windows virtual-key codes)
     private static final int CEF_CONTROL_DOWN = 1 << 2;
@@ -134,9 +130,8 @@ public final class Main {
         if (!config.headless() && !AppInstanceGuard.acquire()) {
             System.err.println("Chass\u00e9 Studio is already running — showing a message and exiting.");
             try {
-                JOptionPane.showMessageDialog(null,
-                        "Chass\u00e9 Studio is already running.\n\nUse the existing window (check your taskbar).",
-                        "Chass\u00e9 Studio", JOptionPane.INFORMATION_MESSAGE);
+                startupDialogs(config).info("Chass\u00e9 Studio is already running",
+                        "Use the existing window \u2014 check your taskbar.");
             } catch (Throwable ignored) {
             }
             System.exit(0);
@@ -285,7 +280,7 @@ public final class Main {
 
             // 3. first-run URL prompt (only if user has cleared the URL via user config)
             if (config.appUrl().isBlank()) {
-                String url = promptForAppUrl(null);
+                String url = promptForAppUrl(startupDialogs(config), null);
                 if (url == null) { System.out.println("No app URL given — exiting."); System.exit(0); return; }
                 config.saveUserAppUrl(url);
             }
@@ -322,8 +317,8 @@ public final class Main {
             downloadBridge.setEventSink(bridge::pushEvent);
             bridge.setDownloads(downloadBridge);
             client.addDownloadHandler(downloadBridge);
-            client.addJSDialogHandler(WindowDialogs.jsDialogs(
-                    () -> frameRef.get() == null ? null : frameRef.get()));
+            final Dialogs dialogs = new Dialogs(() -> frameRef.get(), currentTheme::get);
+            client.addJSDialogHandler(WindowDialogs.jsDialogs(dialogs));
             client.addLifeSpanHandler(WindowDialogs.popupsToSystemBrowser(servers));
             // native file choosers for <input type=file> (Import / Load .smdeck) —
             // the default JCEF dialog handling is unreliable in some builds
@@ -371,6 +366,7 @@ public final class Main {
                 // other palette before the page is up (first run: the web
                 // app's own default, dark)
                 BarTheme initialTheme = BarTheme.of(config.uiTheme());
+                currentTheme.set(initialTheme);
                 frame.setBackground(initialTheme.panel);
 
                 if (!startupAssets.windowIcons.isEmpty()) frame.setIconImages(startupAssets.windowIcons);
@@ -401,18 +397,17 @@ public final class Main {
                 final AtomicReference<TitleBar> self = titleBarRef;
                 TitleBar titleBar = new TitleBar(frame, initialTheme, startupAssets.badgeLogo, new TitleBar.Actions(
                         () -> {
-                            String url = promptForAppUrl(config.appUrl());
+                            String url = promptForAppUrl(dialogs, config.appUrl());
                             if (url != null) { config.saveUserAppUrl(url); browser.loadURL(url); }
                         },
                         browser::reload,
                         () -> shutdown(shutdownStarted, servers, browser, cefApp),
                         () -> toggleFullscreen(fr, self.get()),
-                        () -> JOptionPane.showMessageDialog(fr,
-                                APP_NAME + " Desktop " + APP_VERSION + "\n\n"
-                                        + "Web app: " + (config.appUrl().isBlank() ? "(not configured)" : config.appUrl()) + "\n"
+                        () -> dialogs.info(APP_NAME + " Desktop " + APP_VERSION,
+                                "Web app: " + (config.appUrl().isBlank() ? "(not configured)" : config.appUrl()) + "\n"
                                         + "Sync server port: " + config.port() + "\n\n"
-                                        + "Phone remote starts from the QR panel inside the app.",
-                                "About " + APP_NAME, JOptionPane.INFORMATION_MESSAGE),
+                                        + "The phone remote starts from the QR panel inside the app.",
+                                startupAssets.badgeLogo),
                         () -> toggleMaximize(fr)));
                 titleBarRef.set(titleBar);
                 content.add(titleBar, BorderLayout.NORTH);
@@ -422,13 +417,18 @@ public final class Main {
                 frame.addWindowStateListener(e -> {
                     if (!fullscreen) content.setEdges((e.getNewState() & Frame.MAXIMIZED_BOTH) == 0);
                     titleBar.repaint(); // the maximize glyph flips to "restore"
+                    syncOutline(frame);
                 });
 
                 // the page's theme reports → the bar (and remembered for the next launch)
                 bridge.setThemeListener(json -> {
                     BarTheme t = BarTheme.fromPage(json);
                     config.saveUiTheme(t.name());
-                    SwingUtilities.invokeLater(() -> titleBar.applyTheme(t));
+                    currentTheme.set(t);
+                    SwingUtilities.invokeLater(() -> {
+                        titleBar.applyTheme(t);
+                        syncOutline(frame);
+                    });
                 });
 
                 frame.setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
@@ -438,6 +438,7 @@ public final class Main {
                     }
                 });
                 frame.setVisible(true);
+                syncOutline(frame); // the peer exists now: rounded corners + themed border (Windows 11)
 
                 // Ctrl+F11 fullscreen (webview swallows plain F11)
                 registerF11Toggle(frame, titleBar);
@@ -480,8 +481,7 @@ public final class Main {
             t.printStackTrace();
             String msg = "Failed to start: " + t.getMessage()
                     + "\n\nFirst run downloads ~100 MB of Chromium into ~/.chasse-studio/jcef-bundle.";
-            try { JOptionPane.showMessageDialog(null, msg, APP_NAME + " — startup error",
-                    JOptionPane.ERROR_MESSAGE); } catch (Exception ignored) {}
+            try { startupDialogs(config).info(APP_NAME + " could not start", msg); } catch (Exception ignored) {}
             System.exit(1);
         }
     }
@@ -532,6 +532,25 @@ public final class Main {
         if (frame.getContentPane() instanceof ResizeBorder rb) rb.setEdges(on);
     }
 
+    /**
+     * The window's outline, for its current state and theme: a normal window
+     * gets rounded corners and a 1 px border in the theme's strong line
+     * colour (Windows 11 draws both — anti-aliased, with the system shadow);
+     * maximized and fullscreen windows get neither. Where the OS cannot draw
+     * it, the resize strip paints a hairline instead. EDT.
+     */
+    private static void syncOutline(JFrame frame) {
+        BarTheme t = currentTheme.get();
+        boolean normal = !fullscreen && frame.getExtendedState() != Frame.MAXIMIZED_BOTH;
+        boolean os = WindowChrome.apply(frame, normal, normal ? t.lineStrong : null);
+        if (frame.getContentPane() instanceof ResizeBorder rb) rb.setOutline(os ? null : t.lineStrong);
+    }
+
+    /** The dialogs shown before the window exists (startup messages, the first-run URL). */
+    private static Dialogs startupDialogs(AppConfig config) {
+        return new Dialogs(() -> null, () -> BarTheme.of(config == null ? null : config.uiTheme()));
+    }
+
     /** What a key press means for the window's fullscreen state. */
     enum FsKey { NONE, EXIT, TOGGLE }
 
@@ -579,6 +598,7 @@ public final class Main {
         frame.setExtendedState(Frame.NORMAL);
         frame.setBounds(monitor);
         frame.toFront();
+        syncOutline(frame); // square — a rounded corner would show the desktop
         showFullscreenHint(frame, titleBar, monitor);
     }
 
@@ -594,6 +614,7 @@ public final class Main {
             frame.setMaximizedBounds(workArea(frame.getGraphicsConfiguration()));
             setResizeEdges(frame, true);
         }
+        syncOutline(frame);
     }
 
     /**
@@ -605,27 +626,9 @@ public final class Main {
      */
     private static void showFullscreenHint(JFrame frame, TitleBar titleBar, Rectangle monitor) {
         hideFullscreenHint();
-        JWindow w = new JWindow(frame);
-        w.setFocusableWindowState(false);
-        BarTheme th = titleBar.theme();
-        JButton b = new JButton("✕   Exit full screen   ·   Esc");
-        b.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 13));
-        b.setForeground(th.ink);
-        b.setBackground(th.pop);
-        b.setOpaque(true);
-        b.setFocusable(false);
-        b.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(th.line, 1),
-                BorderFactory.createEmptyBorder(9, 18, 9, 18)));
-        b.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-        b.addMouseListener(new MouseAdapter() {
-            @Override public void mouseEntered(MouseEvent e) { b.setBackground(th.panel2); }
-            @Override public void mouseExited (MouseEvent e) { b.setBackground(th.pop); }
-        });
-        b.addActionListener(ev -> exitFullscreen(frame, titleBar));
-        w.add(b);
-        w.pack();
-        w.setLocation(monitor.x + (monitor.width - w.getWidth()) / 2, monitor.y + 10);
+        JWindow w = Dialogs.pill(frame, titleBar.theme(), "Exit full screen   ·   Esc",
+                () -> exitFullscreen(frame, titleBar));
+        w.setLocation(monitor.x + (monitor.width - w.getWidth()) / 2, monitor.y + 6);
 
         final long[] hideAt = { System.currentTimeMillis() + 3500 };
         w.setVisible(true);
@@ -704,18 +707,17 @@ public final class Main {
         return decodeStartupAssets().windowIcons;
     }
 
-    private static String promptForAppUrl(String current) {
+    private static String promptForAppUrl(Dialogs dialogs, String current) {
+        String message = "The hosted Chassé Studio web app this window loads, e.g. https://your-site.vercel.app";
+        String value = current == null || current.isBlank() ? "https://your-site.vercel.app" : current;
         while (true) {
-            String url = (String) JOptionPane.showInputDialog(null,
-                    "Enter the Chassé Studio web app URL\n(e.g. https://your-site.vercel.app)",
-                    APP_NAME + " — first run", JOptionPane.PLAIN_MESSAGE, null, null,
-                    current == null || current.isBlank() ? "https://your-site.vercel.app" : current);
+            String url = dialogs.prompt(current == null ? APP_NAME + " — first run" : "Change app URL",
+                    message, value, current == null ? "Continue" : "Load", "Cancel");
             if (url == null) return null;
             url = url.trim();
             if (isValidHttpUrl(url)) return url;
-            JOptionPane.showMessageDialog(null,
-                    "Please enter a full http(s) URL (including https://).",
-                    "Invalid URL", JOptionPane.ERROR_MESSAGE);
+            value = url;
+            message = "Please enter a full http(s) URL, including https://";
         }
     }
 

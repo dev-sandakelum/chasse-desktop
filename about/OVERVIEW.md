@@ -13,7 +13,11 @@ Chassé Studio Desktop is the native shell for the hosted Chassé Studio web app
    `File / View / Help` menus, the page title, thin window controls) painted
    in the web app's own light/dark chrome palette — the page reports its
    theme over the bridge, so the bar always continues the web toolbar — plus
-   `Ctrl+F11` fullscreen.
+   `Ctrl+F11` fullscreen. On Windows 11 the OS rounds the window and draws
+   its 1 px border in the theme's line colour (`WindowChrome`, JNA → DWM);
+   every native dialog (About, app URL, JS alert/confirm/prompt, unsaved
+   changes, startup errors) is a themed rounded card (`Dialogs`), not a
+   `JOptionPane`.
 2. **LAN sync server** (Javalin, HTTP + WebSocket on one port, default
    `0.0.0.0:8765`) that serves a self-contained phone remote page and lets any
    phone on the same Wi-Fi drive the presentation (token-authenticated).

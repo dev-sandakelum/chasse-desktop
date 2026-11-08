@@ -5,7 +5,9 @@ import javax.swing.JFrame;
 import javax.swing.JPanel;
 import java.awt.BorderLayout;
 import java.awt.Cursor;
+import java.awt.Color;
 import java.awt.Dimension;
+import java.awt.Graphics;
 import java.awt.Point;
 import java.awt.Rectangle;
 import java.awt.event.MouseAdapter;
@@ -18,6 +20,11 @@ import java.awt.event.MouseEvent;
  * its own). The strip is painted in the bar colour so it reads as the window
  * edge. Edges are switched off while maximized / fullscreen — there is
  * nothing to resize and the strip would show as a gap.
+ *
+ * <p>The window's outline is the OS's where it can draw one (Windows 11:
+ * rounded corners and a 1 px border in the theme's line colour — {@link
+ * WindowChrome}); elsewhere this strip paints a 1 px hairline at its outer
+ * edge so the window still has a defined edge over any wallpaper.</p>
  */
 final class ResizeBorder extends JPanel {
 
@@ -25,6 +32,7 @@ final class ResizeBorder extends JPanel {
 
     private final JFrame frame;
     private boolean edges = true;
+    private Color outline;           // the hairline colour; null = the OS draws the border
     private int dir;                 // Cursor.*_RESIZE_CURSOR, or 0 = not on an edge
     private Point dragStart;
     private Rectangle startBounds;
@@ -60,6 +68,20 @@ final class ResizeBorder extends JPanel {
         };
         addMouseListener(m);
         addMouseMotionListener(m);
+    }
+
+    /** The outline hairline colour ({@code null}: none — the OS draws the window border). */
+    void setOutline(Color c) {
+        outline = c;
+        repaint();
+    }
+
+    @Override protected void paintComponent(Graphics g) {
+        super.paintComponent(g);
+        if (edges && outline != null) {
+            g.setColor(outline);
+            g.drawRect(0, 0, getWidth() - 1, getHeight() - 1);
+        }
     }
 
     /** on = normal window (thin resize strip); off = maximized / fullscreen (no strip). */

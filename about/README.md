@@ -9,7 +9,8 @@ Chassé Studio Desktop is the native shell for the hosted Chassé Studio web app
 single-process Java 17 + Swing application with three pillars:
 
 1. **Embedded Chromium webview** (JCEF via `jcefmaven`) in an undecorated window
-   with a fully custom dark title bar, File/View/Help menus and `Ctrl+F11`
+   with a fully custom light/dark title bar, File/View/Help menus, themed
+   dialogs, a Windows 11 rounded outline (JNA → DWM) and `Ctrl+F11`
    fullscreen.
 2. **LAN sync server** (Javalin, HTTP + WebSocket on one port, default
    `0.0.0.0:8765`) that serves a self-contained phone remote page and lets any

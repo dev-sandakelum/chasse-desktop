@@ -12,8 +12,6 @@ import org.cef.misc.BoolRef;
 
 import java.awt.Desktop;
 import java.net.URI;
-import java.util.function.Supplier;
-import javax.swing.JOptionPane;
 import javax.swing.SwingUtilities;
 import javax.swing.UIManager;
 
@@ -24,15 +22,15 @@ import javax.swing.UIManager;
  *   <li><b>JavaScript dialogs</b> — JCEF never renders alert()/confirm()/
  *       prompt() unless the client implements {@link CefJSDialogHandler};
  *       without this handler they silently vanish (calls return undefined).
- *       This class routes them to native Swing dialogs on the EDT. Blocking
- *       semantics are preserved: the JS thread waits until the user answers
- *       (that is what a modal dialog is).</li>
+ *       This class routes them to the themed native {@link Dialogs} on the
+ *       EDT. Blocking semantics are preserved: the JS thread waits until the
+ *       user answers (that is what a modal dialog is).</li>
  *   <li><b>window.open / target="_blank"</b> — JCEF's default popup handling
  *       tries to create a raw JCEF popup window with no sensible chrome and
  *       no history; instead the URL is opened in the user's system browser
  *       ({@link java.awt.Desktop#browse}) and the popup itself is cancelled.</li>
  *   <li><b>beforeunload confirmations</b> — the page's unload guard (unsaved
- *       edits) gets a real native Yes/No instead of silently dropping the
+ *       edits) gets a real native Leave/Stay instead of silently dropping the
  *       dialog.</li>
  * </ul>
  */
@@ -45,8 +43,8 @@ public final class WindowDialogs {
     /* JS dialogs (alert / confirm / prompt / beforeunload)               */
     /* ------------------------------------------------------------------ */
 
-    /** Creates the CefJSDialogHandler implementation. */
-    public static CefJSDialogHandler jsDialogs(Supplier<java.awt.Window> parent) {
+    /** Creates the CefJSDialogHandler implementation over the themed dialogs. */
+    static CefJSDialogHandler jsDialogs(Dialogs dialogs) {
         return new CefJSDialogHandlerAdapter() {
             @Override
             public boolean onJSDialog(CefBrowser browser, String originUrl, JSDialogType type,
@@ -56,26 +54,22 @@ public final class WindowDialogs {
                 SwingUtilities.invokeLater(() -> {
                     boolean ok;
                     String input;
+                    String title = appTitle(originUrl);
+                    String text = messageText == null ? "" : messageText;
                     switch (type) {
                         case JSDIALOGTYPE_ALERT -> {
-                            JOptionPane.showMessageDialog(parent.get(), messageText,
-                                    appTitle(originUrl), JOptionPane.INFORMATION_MESSAGE);
+                            dialogs.info(title, text);
                             ok = true;
                             input = "";
                         }
                         case JSDIALOGTYPE_CONFIRM -> {
-                            ok = JOptionPane.showConfirmDialog(parent.get(), messageText,
-                                    appTitle(originUrl),
-                                    JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE)
-                                    == JOptionPane.YES_OPTION;
+                            ok = dialogs.confirm(title, text, "OK", "Cancel", false);
                             input = "";
                         }
                         case JSDIALOGTYPE_PROMPT -> {
-                            Object result = JOptionPane.showInputDialog(parent.get(), messageText,
-                                    appTitle(originUrl),
-                                    JOptionPane.QUESTION_MESSAGE, null, null, defaultPromptText);
-                            ok = result != null; // null = user pressed Cancel
-                            input = result == null ? "" : String.valueOf(result);
+                            String result = dialogs.prompt(title, text, defaultPromptText, "OK", "Cancel");
+                            ok = result != null; // null = the user cancelled
+                            input = result == null ? "" : result;
                         }
                         default -> {
                             ok = true;
@@ -92,12 +86,11 @@ public final class WindowDialogs {
             public boolean onBeforeUnloadDialog(CefBrowser browser, String messageText,
                                                 boolean isReload, CefJSDialogCallback callback) {
                 SwingUtilities.invokeLater(() -> {
-                    int r = JOptionPane.showConfirmDialog(parent.get(),
+                    boolean leave = dialogs.confirm("Unsaved changes",
                             (messageText == null || messageText.isBlank()
-                                    ? "Leave this page with unsaved changes?" : messageText),
-                            "Chass\u00e9 — unsaved changes",
-                            JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
-                    callback.Continue(r == JOptionPane.YES_OPTION, "");
+                                    ? "Leave this page? Edits you have not saved will be lost." : messageText),
+                            isReload ? "Reload" : "Leave", "Stay", true);
+                    callback.Continue(leave, "");
                 });
                 return true;
             }
@@ -112,10 +105,15 @@ public final class WindowDialogs {
         };
     }
 
-    private static String appTitle(String originUrl) {
-        return originUrl != null && originUrl.length() > 60
-                ? "Chass\u00e9 — " + originUrl.substring(0, 60) + "\u2026"
-                : "Chass\u00e9 — " + (originUrl == null ? "" : originUrl);
+    /** The dialog title: the page's host (what a browser shows — "example.com says"). */
+    static String appTitle(String originUrl) {
+        String host = null;
+        try {
+            if (originUrl != null && !originUrl.isBlank()) host = URI.create(originUrl.trim()).getHost();
+        } catch (RuntimeException ignored) {
+            host = null;
+        }
+        return host == null || host.isBlank() ? Main.APP_NAME : host + " says";
     }
 
     /* ------------------------------------------------------------------ */
@@ -164,7 +162,7 @@ public final class WindowDialogs {
     }
 
     static {
-        // dialogs inherit the app look & feel (best-effort)
+        // the file choosers inherit the system look & feel (best-effort)
         try {
             UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
         } catch (Throwable ignored) {

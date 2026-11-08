@@ -6,7 +6,7 @@
 
   <groupId>com.chasse</groupId>
   <artifactId>chasse-studio-desktop</artifactId>
-  <version>1.7.1</version>
+  <version>1.8.0</version>
   <packaging>jar</packaging>
 
   <name>Chasse Studio Desktop</name>
@@ -34,6 +34,14 @@
       <groupId>io.javalin</groupId>
       <artifactId>javalin</artifactId>
       <version>6.7.0</version>
+    </dependency>
+    <!-- Native window chrome on Windows 11 (DWM rounded corners + border
+         colour for the undecorated window and the themed dialogs). Loaded
+         lazily and guarded: elsewhere the window keeps square corners. -->
+    <dependency>
+      <groupId>net.java.dev.jna</groupId>
+      <artifactId>jna</artifactId>
+      <version>5.14.0</version>
     </dependency>
     <dependency>
       <groupId>com.google.code.gson</groupId>

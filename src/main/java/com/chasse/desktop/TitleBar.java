@@ -41,6 +41,8 @@ import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.event.MouseMotionAdapter;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
 import java.awt.geom.RoundRectangle2D;
 import java.util.ArrayList;
 import java.util.List;
@@ -93,6 +95,12 @@ final class TitleBar extends JPanel {
     /** separator: 1 px line with the web's 5px 6px margin */
     private static final int SEP_MARGIN_Y = 5;
     private static final int SEP_MARGIN_X = 6;
+    /** the menu header hover pill: inset from the bar edges, 6 px corners (web toolbar buttons) */
+    private static final int PILL_INSET_Y = 4;
+    private static final int PILL_INSET_X = 2;
+    private static final int PILL_RADIUS = 6;
+    /** client property on a menu header while the pointer is over it */
+    private static final String HOVER = "chasse.menu.hover";
 
     /** client property on a popup that should get a translucent window (see {@link TranslucentPopups}) */
     private static final String TRANSLUCENT_WANTED = "chasse.popup.translucentWanted";
@@ -104,6 +112,8 @@ final class TitleBar extends JPanel {
                    Runnable toggleFullscreen, Runnable about, Runnable toggleMaximize) {}
 
     private volatile BarTheme theme;
+    /** false while another window has the focus — the bar's text dims, like every native title bar */
+    private volatile boolean active = true;
     private final JFrame frame;
     private final JLabel title;
     private final JMenuBar menuBar;
@@ -134,7 +144,7 @@ final class TitleBar extends JPanel {
 
         // ── centre: the window title, muted ──────────────────────────────────
         title = new JLabel("", SwingConstants.CENTER);
-        title.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
+        title.setFont(Dialogs.ui(Font.PLAIN, 12));
         title.setBorder(BorderFactory.createEmptyBorder(0, 12, 0, 12));
 
         // ── right: thin window controls ──────────────────────────────────────
@@ -169,6 +179,11 @@ final class TitleBar extends JPanel {
             }
         });
         setCursor(Cursor.getDefaultCursor());
+        // active / inactive: dim the labels while another window (a dialog, another app) has the focus
+        frame.addWindowFocusListener(new WindowAdapter() {
+            @Override public void windowGainedFocus(WindowEvent e) { setActive(true); }
+            @Override public void windowLostFocus(WindowEvent e) { setActive(false); }
+        });
         applyTheme(initial);
     }
 
@@ -181,6 +196,17 @@ final class TitleBar extends JPanel {
         String t = text == null ? "" : text.trim();
         title.setText(t);
         frame.setTitle(t.isEmpty() ? Main.APP_NAME : t); // taskbar / Alt-Tab
+    }
+
+    private void setActive(boolean on) {
+        active = on;
+        title.setForeground(titleInk(theme));
+        repaint();
+    }
+
+    /** The title's ink: muted, and softer still while the window is inactive. */
+    private Color titleInk(BarTheme t) {
+        return active ? t.mut : BarTheme.over(new Color(t.mut.getRed(), t.mut.getGreen(), t.mut.getBlue(), 140), t.panel);
     }
 
     /** Hidden in fullscreen. */
@@ -197,7 +223,7 @@ final class TitleBar extends JPanel {
     void applyTheme(BarTheme t) {
         theme = t;
         setBackground(t.panel);
-        title.setForeground(t.mut);
+        title.setForeground(titleInk(t));
         frame.getContentPane().setBackground(t.panel);
         frame.setBackground(t.panel);
         for (JMenu m : menus) {
@@ -219,7 +245,7 @@ final class TitleBar extends JPanel {
     /* ------------------------------------------------------------------ */
 
     private JMenuBar buildMenuBar(Actions a) {
-        Font menuFont = new Font(Font.SANS_SERIF, Font.PLAIN, 13);
+        Font menuFont = Dialogs.ui(Font.PLAIN, 13);
 
         JMenu file = menu("File", menuFont);
         file.add(item("Change app URL…", menuFont, a.changeAppUrl()));
@@ -269,6 +295,10 @@ final class TitleBar extends JPanel {
         m.setBorderPainted(false);
         m.setMargin(new Insets(0, 2, 0, 2));
         m.setBorder(BorderFactory.createEmptyBorder(0, 6, 0, 6));
+        m.addMouseListener(new MouseAdapter() {
+            @Override public void mouseEntered(MouseEvent e) { m.putClientProperty(HOVER, Boolean.TRUE); m.repaint(); }
+            @Override public void mouseExited(MouseEvent e) { m.putClientProperty(HOVER, Boolean.FALSE); m.repaint(); }
+        });
         stylePopup(m.getPopupMenu());
         menus.add(m);
         return m;
@@ -362,16 +392,25 @@ final class TitleBar extends JPanel {
             try {
                 int w = c.getWidth();
                 int h = c.getHeight();
-                if (open) {
+                boolean hover = Boolean.TRUE.equals(m.getClientProperty(HOVER));
+                if (open || hover) {
+                    // the web toolbar button: raised surface, hairline edge (stronger while open), rounded
+                    g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                    g2.setRenderingHint(RenderingHints.KEY_STROKE_CONTROL, RenderingHints.VALUE_STROKE_PURE);
+                    float pw = w - 2 * PILL_INSET_X, ph = h - 2 * PILL_INSET_Y;
                     g2.setColor(t.panel2);
-                    g2.fillRect(0, 0, w, h);
+                    g2.fill(new RoundRectangle2D.Float(PILL_INSET_X, PILL_INSET_Y, pw, ph, 2 * PILL_RADIUS, 2 * PILL_RADIUS));
+                    g2.setColor(open ? t.hovline : t.line);
+                    g2.setStroke(new BasicStroke(1f));
+                    g2.draw(new RoundRectangle2D.Float(PILL_INSET_X + 0.5f, PILL_INSET_Y + 0.5f, pw - 1, ph - 1,
+                            2 * PILL_RADIUS - 1, 2 * PILL_RADIUS - 1));
                 }
                 textHints(g2);
                 g2.setFont(m.getFont());
                 FontMetrics fm = g2.getFontMetrics();
                 int x = (w - fm.stringWidth(m.getText())) / 2;
                 int y = (h - fm.getHeight()) / 2 + fm.getAscent();
-                g2.setColor(open ? t.ink : t.ink2);
+                g2.setColor(!active ? t.mut : open ? t.ink : t.ink2);
                 g2.drawString(m.getText(), x, y);
             } finally {
                 g2.dispose();
@@ -605,7 +644,7 @@ final class TitleBar extends JPanel {
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
             g2.setRenderingHint(RenderingHints.KEY_STROKE_CONTROL, RenderingHints.VALUE_STROKE_PURE);
             BarTheme t = theme;
-            Color fg = t.ink2;
+            Color fg = active ? t.ink2 : t.mut;
             if (hovered) {
                 boolean close = kind == Kind.CLOSE;
                 g2.setColor(close ? CLOSE_HOVER : t.panel2);
